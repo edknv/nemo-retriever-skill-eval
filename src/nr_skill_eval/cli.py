@@ -21,6 +21,7 @@ from nr_skill_eval.dataset import DatasetEntry, load_config, load_eval_manifest
 from nr_skill_eval.report import overall_recall, write_summary
 from nr_skill_eval.runner import (
     CONDITIONS,
+    _extract_compact_trace,
     cleanup_condition_workdir,
     run_condition,
     save_trial,
@@ -82,6 +83,27 @@ def _build_judge(cfg: dict) -> Optional[Any]:
     )
     typer.echo(f"Judge enabled: model={judge.model}")
     return judge
+
+
+def _build_trace_summarizer(cfg: dict) -> Optional[Any]:
+    """Construct a ``TraceSummarizer`` from ``cfg['summarizer']`` or return ``None``.
+
+    Shells out to the ``claude`` CLI (same binary as the trial runs), so it
+    reuses Claude Code's auth — no extra API key required. Independent of the
+    judge: judging stays on a deterministic cheap model for cross-run score
+    consistency; summarization can use a stronger narrator.
+    """
+    sum_cfg = cfg.get("summarizer") or {}
+    if not sum_cfg.get("enabled", True):
+        typer.echo("Trace summarizer disabled by config (summarizer.enabled=false).")
+        return None
+    from nr_skill_eval.trace_summarizer import TraceSummarizer
+
+    summarizer = TraceSummarizer.from_kwargs(
+        model=str(sum_cfg.get("model", "claude-opus-4-7")),
+    )
+    typer.echo(f"Trace summarizer enabled: model={summarizer.model}")
+    return summarizer
 
 
 def _resolve_domain_label(entries: list[DatasetEntry], cfg: dict, domain: str) -> str:
@@ -197,6 +219,7 @@ def run_command(
     testdata_prefixes = tuple(str(p) for p in testdata_prefixes_raw)
 
     judge = _build_judge(cfg)
+    summarizer = _build_trace_summarizer(cfg)
 
     base_dir = str(artifacts_root) if artifacts_root else None
     session_dir = create_session_dir("skilleval", base_dir=base_dir)
@@ -236,6 +259,20 @@ def run_command(
                 judge=judge,
                 testdata_prefixes=testdata_prefixes,
             )
+            if summarizer is not None and results:
+                trace = _extract_compact_trace(workdir, results[0].session_id)
+                if trace:
+                    narrative = summarizer.summarize(condition=cond, domain=domain, trace=trace)
+                    if narrative:
+                        for r in results:
+                            if r.is_setup:
+                                r.tool_use_summary = narrative
+                                break
+                        typer.echo(f"  tool-use summary: {len(narrative)} chars")
+                    else:
+                        typer.echo("  tool-use summary: (summarizer returned empty)")
+                else:
+                    typer.echo("  tool-use summary skipped: session JSONL unavailable")
             for r in results:
                 save_trial(r, session_dir)
                 kind = "setup" if r.is_setup else f"entry_id={r.entry_id} query_id={r.query_id}"

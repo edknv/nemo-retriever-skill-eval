@@ -64,6 +64,7 @@ class TrialResult:
     judge_score: int | None = None
     judge_reasoning: str = ""
     judge_error: str = ""
+    tool_use_summary: str = ""
 
 
 def _remap_pdf_paths(text: str, prefixes: tuple[str, ...]) -> str:
@@ -402,6 +403,115 @@ def _claude_session_log_path(workdir: Path, session_uuid: str) -> Path:
     if not slug.startswith("-"):
         slug = "-" + slug
     return Path.home() / ".claude" / "projects" / slug / f"{session_uuid}.jsonl"
+
+
+_TRACE_TOOL_INPUT_CAP = 200
+_TRACE_FINAL_TEXT_CAP = 400
+
+
+def _truncate(s: str, cap: int) -> str:
+    s = " ".join(s.split())
+    return s if len(s) <= cap else s[: cap - 1] + "…"
+
+
+def _format_tool_input(name: str, inp: dict[str, Any]) -> str:
+    """Render a tool_use input dict to a single short line."""
+    if name == "Bash":
+        cmd = str(inp.get("command", ""))
+        return f"Bash: {_truncate(cmd, _TRACE_TOOL_INPUT_CAP)}"
+    if name == "Read":
+        path = str(inp.get("file_path", ""))
+        offset = inp.get("offset")
+        limit = inp.get("limit")
+        tail = f" offset={offset} limit={limit}" if offset is not None or limit is not None else ""
+        return f"Read: {path}{tail}"
+    if name == "Grep":
+        pat = str(inp.get("pattern", ""))
+        path = str(inp.get("path", ""))
+        return f"Grep: pattern={_truncate(pat, 80)} path={path}"
+    if name == "Glob":
+        return f"Glob: {inp.get('pattern', '')}"
+    if name in ("Edit", "Write"):
+        return f"{name}: {inp.get('file_path', '')}"
+    parts = [f"{k}={_truncate(str(v), 80)}" for k, v in inp.items()]
+    return f"{name}: " + " ".join(parts) if parts else name
+
+
+def _extract_compact_trace(workdir: Path, session_uuid: str) -> str | None:
+    """Walk the Claude Code session JSONL and emit a turn-organized text trace.
+
+    Lists per turn: the user prompt, every ``tool_use`` invocation with
+    truncated inputs, and the agent's final assistant text. ``tool_result``
+    content is omitted — the summarizer needs actions, not tool-output noise.
+    Returns ``None`` if the JSONL is missing or unreadable.
+    """
+    log_path = _claude_session_log_path(workdir, session_uuid)
+    if not log_path.exists():
+        return None
+
+    turn_idx = 0
+    lines_out: list[str] = []
+    current_assistant_text: list[str] = []
+    try:
+        with log_path.open(encoding="utf-8") as f:
+            for raw_line in f:
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    ev = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                msg = ev.get("message") or {}
+                role = msg.get("role") or ev.get("type")
+                content = msg.get("content")
+
+                if role == "user":
+                    if current_assistant_text:
+                        joined = " ".join(current_assistant_text).strip()
+                        if joined:
+                            lines_out.append(f"  assistant: {_truncate(joined, _TRACE_FINAL_TEXT_CAP)}")
+                        current_assistant_text = []
+                    turn_idx += 1
+                    user_text = ""
+                    if isinstance(content, str):
+                        user_text = content
+                    elif isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                user_text = str(item.get("text", ""))
+                                break
+                    label = "setup" if turn_idx == 1 else f"query {turn_idx - 1}"
+                    lines_out.append("")
+                    lines_out.append(f"[Turn {turn_idx} — {label}]")
+                    if user_text:
+                        lines_out.append(f"  user: {_truncate(user_text, _TRACE_FINAL_TEXT_CAP)}")
+                elif role == "assistant" and isinstance(content, list):
+                    for item in content:
+                        if not isinstance(item, dict):
+                            continue
+                        itype = item.get("type")
+                        if itype == "tool_use":
+                            name = str(item.get("name", "?"))
+                            inp = item.get("input") or {}
+                            if isinstance(inp, dict):
+                                lines_out.append(f"  tool_use {_format_tool_input(name, inp)}")
+                            else:
+                                lines_out.append(f"  tool_use {name}")
+                        elif itype == "text":
+                            text = str(item.get("text", "")).strip()
+                            if text:
+                                current_assistant_text.append(text)
+    except OSError:
+        return None
+
+    if current_assistant_text:
+        joined = " ".join(current_assistant_text).strip()
+        if joined:
+            lines_out.append(f"  assistant: {_truncate(joined, _TRACE_FINAL_TEXT_CAP)}")
+
+    trace = "\n".join(lines_out).strip()
+    return trace or None
 
 
 def _scan_transcript_for_signals(

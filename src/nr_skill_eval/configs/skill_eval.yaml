@@ -94,3 +94,21 @@ judge:
   model: nvidia_nim/mistralai/mixtral-8x22b-instruct-v0.1
   api_base: https://integrate.api.nvidia.com/v1
   api_key_env: NVIDIA_API_KEY
+
+# ---------------------------------------------------------------------------
+# Tool-use summarizer
+# ---------------------------------------------------------------------------
+# After each (condition, domain) session, the harness reads the Claude Code
+# session JSONL and asks a strong Anthropic model to narrate what tools the
+# agent called and what strategy it took. Result is stamped onto the setup-
+# turn TrialResult and rendered as a "Tool-use summaries" section in
+# session_summary.md.
+#
+# Shells out to ``claude --print`` so it reuses Claude Code's existing auth
+# (subscription/OAuth) — no extra API key needed. Decoupled from the judge on
+# purpose: this fires only once per session (~3× per run), so a stronger
+# narrator (Claude Opus by default) is cheap enough, while judging stays on
+# its own deterministic model above.
+summarizer:
+  enabled: true
+  model: claude-opus-4-7
