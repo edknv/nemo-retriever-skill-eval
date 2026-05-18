@@ -12,7 +12,6 @@ import logging
 import os
 import re
 import shutil
-import stat
 import subprocess
 import time
 import uuid
@@ -64,6 +63,7 @@ class TrialResult:
     judge_score: int | None = None
     judge_reasoning: str = ""
     judge_error: str = ""
+    tool_use_summary: str = ""
 
 
 def _remap_pdf_paths(text: str, prefixes: tuple[str, ...]) -> str:
@@ -105,16 +105,6 @@ def _build_pdf_symlinks(pdf_source: Path, dest: Path) -> None:
         target.symlink_to(pdf.resolve())
 
 
-def _write_shim(shim_dir: Path, name: str) -> None:
-    shim_dir.mkdir(parents=True, exist_ok=True)
-    shim = shim_dir / name
-    shim.write_text(
-        "#!/usr/bin/env bash\n" f"echo 'skill_eval shim: {name} not available in this trial' >&2\n" "exit 127\n",
-        encoding="utf-8",
-    )
-    shim.chmod(shim.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-
-
 def _copy_skill(skill_source: Path, dest: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     if (dest / "SKILL.md").exists():
@@ -123,38 +113,6 @@ def _copy_skill(skill_source: Path, dest: Path) -> None:
     ref_src = skill_source / "references"
     if ref_src.is_dir():
         shutil.copytree(ref_src, dest / "references", dirs_exist_ok=True)
-
-
-# Bash patterns that route the agent into the nemo_retriever library, regardless
-# of whether it tries the CLI, a Python module invocation, or a direct full-path
-# call into the project's venv. Used in c1's project-level settings.json. The
-# patterns are intentionally written as substring globs (Claude Code semantics)
-# so they catch the command line as the agent assembled it.
-_C1_BASH_DENY_PATTERNS: tuple[str, ...] = (
-    "Bash(retriever:*)",
-    "Bash(*nemo_retriever*)",
-    "Bash(*nemo-retriever*)",
-    "Bash(python*-m*nemo_retriever*)",
-    "Bash(uv*run*retriever*)",
-    "Bash(*/bin/retriever*)",
-    # Hide the HuggingFace model cache so the agent can't enumerate the
-    # NVIDIA stack that c2/c3 populated. HF env vars (HF_HOME etc.) are
-    # redirected in _env_for; these deny patterns close the `ls`/`find`
-    # side channel that bypasses env-var resolution.
-    "Bash(*huggingface*)",
-    "Bash(*.cache/huggingface*)",
-)
-
-
-def _c1_settings_json() -> str:
-    """Project-level settings for the c1_base trial.
-
-    `--permission-mode bypassPermissions` auto-approves tool calls that aren't
-    explicitly denied; the deny patterns below catch every reasonable path
-    into the nemo_retriever library so the agent has to fall back on CPU-only
-    primitives (Read, Grep, pdftotext, etc.).
-    """
-    return json.dumps({"permissions": {"deny": list(_C1_BASH_DENY_PATTERNS)}}, indent=2) + "\n"
 
 
 def _build_condition_workdir(
@@ -168,30 +126,25 @@ def _build_condition_workdir(
 
     Workdir contents:
       - pdfs/ symlink farm into the source PDF folder
-      - .claude/ sandbox (settings + per-condition skill copy)
-      - .bin/retriever shim (c1 only) so retriever is unavailable on PATH
+      - .claude/ sandbox (empty settings + per-condition skill copy)
 
-    The agent itself creates any retrieval artifacts (e.g., ./lancedb/) inside the
-    workdir on the setup turn.
+    c1_base is stock Claude Code with no skill loaded and slash commands
+    disabled, but otherwise full access to whatever is on the host. The agent
+    itself creates any retrieval artifacts (e.g. ./lancedb/) inside the workdir
+    on the setup turn.
     """
     domain_seg = f"_{domain}" if domain else ""
     workdir = root / f"{condition}{domain_seg}_{uuid.uuid4().hex[:8]}"
     workdir.mkdir(parents=True, exist_ok=True)
     _build_pdf_symlinks(pdf_source, workdir / "pdfs")
     (workdir / ".claude").mkdir(parents=True, exist_ok=True)
-    # c1 gets explicit Bash deny rules; c2/c3 keep the empty settings.json.
-    settings_text = _c1_settings_json() if condition == "c1_base" else "{}\n"
-    (workdir / ".claude" / "settings.json").write_text(settings_text, encoding="utf-8")
-    # c2 and c3 both have retriever installed AND the nemo-retriever skill loaded.
+    (workdir / ".claude" / "settings.json").write_text("{}\n", encoding="utf-8")
+    # c2 and c3 both have the nemo-retriever skill loaded.
     # The c2/c3 distinction is purely the prompt style (NL vs explicit slash command).
     if condition in ("c2_retriever", "c3_retriever_skill"):
         if skill_source is None:
             raise ValueError(f"condition '{condition}' requires skill_source_dir to be set in the config")
         _copy_skill(skill_source, workdir / ".claude" / "skills" / "nemo-retriever")
-    if condition == "c1_base":
-        _write_shim(workdir / ".bin", "retriever")
-        # Empty HuggingFace cache redirect; env vars are wired up in _env_for.
-        (workdir / ".hf_empty").mkdir(parents=True, exist_ok=True)
     return workdir
 
 
@@ -204,21 +157,6 @@ def cleanup_condition_workdir(workdir: Path) -> None:
         return
     shutil.rmtree(workdir, ignore_errors=True)
     logger.info("cleaned up workdir %s", workdir)
-
-
-def _env_for(condition: str, workdir: Path) -> dict[str, str]:
-    env = os.environ.copy()
-    if condition == "c1_base":
-        env["PATH"] = f"{workdir / '.bin'}{os.pathsep}{env.get('PATH', '')}"
-        # Point HuggingFace cache env vars at an empty workdir-local dir so
-        # any HF Python tooling the agent invokes sees no cached models.
-        # Direct filesystem reads (e.g. `ls ~/.cache/huggingface/`) are
-        # blocked separately by the Bash deny rules in settings.json.
-        hf_empty = str(workdir / ".hf_empty")
-        env["HF_HOME"] = hf_empty
-        env["HF_HUB_CACHE"] = hf_empty
-        env["TRANSFORMERS_CACHE"] = hf_empty
-    return env
 
 
 def _build_command(
@@ -246,22 +184,19 @@ def _build_command(
         str(workdir),
         "--permission-mode",
         "bypassPermissions",
+        "--allow-dangerously-skip-permissions",
         "--max-budget-usd",
         str(budget_usd),
         "--setting-sources",
         "project",
     ]
-    # c2/c3 run fully un-gated. c1 omits --allow-dangerously-skip-permissions
-    # so the project-level settings.json deny rules are actually consulted by
-    # Claude Code instead of being short-circuited.
-    if condition != "c1_base":
-        cmd.append("--allow-dangerously-skip-permissions")
     if resume:
         cmd.extend(["--resume", session_uuid])
     else:
         cmd.extend(["--session-id", session_uuid])
-    # Only c1 disables skills entirely. c2 has the skill loaded but uses NL prompt
-    # (relying on description-based auto-discovery); c3 explicitly invokes via slash.
+    # c1 disables slash commands so it cannot invoke the nemo-retriever skill;
+    # c2 has the skill loaded but uses NL prompt (description-based auto-
+    # discovery); c3 explicitly invokes via slash command.
     if condition == "c1_base":
         cmd.append("--disable-slash-commands")
     return cmd
@@ -375,12 +310,7 @@ def _retriever_in_command(cmd: str) -> bool:
         if head.endswith("/retriever") and "/" in head[: -len("/retriever") + 1]:
             # An absolute or relative path whose final component is `retriever`,
             # e.g. /home/.../venv/bin/retriever. Reject pure ``/retriever`` which
-            # is implausible as a real binary path. Also reject ``.bin/retriever``
-            # paths: c1_base's workdir setup installs a deny-shim with that exact
-            # name (see ``_write_shim``); invoking the shim is the *opposite* of
-            # using the real retriever CLI.
-            if "/.bin/retriever" in head:
-                continue
+            # is implausible as a real binary path.
             return True
         # ``uv run retriever ...`` and ``python -m nemo_retriever ...`` —
         # check the first two tokens of the segment.
@@ -402,6 +332,119 @@ def _claude_session_log_path(workdir: Path, session_uuid: str) -> Path:
     if not slug.startswith("-"):
         slug = "-" + slug
     return Path.home() / ".claude" / "projects" / slug / f"{session_uuid}.jsonl"
+
+
+_TRACE_TOOL_INPUT_CAP = 200
+_TRACE_FINAL_TEXT_CAP = 400
+
+
+def _truncate(s: str, cap: int) -> str:
+    s = " ".join(s.split())
+    return s if len(s) <= cap else s[: cap - 1] + "…"
+
+
+def _format_tool_input(name: str, inp: dict[str, Any]) -> str:
+    """Render a tool_use input dict to a single short line."""
+    if name == "Bash":
+        cmd = str(inp.get("command", ""))
+        return f"Bash: {_truncate(cmd, _TRACE_TOOL_INPUT_CAP)}"
+    if name == "Read":
+        path = str(inp.get("file_path", ""))
+        offset = inp.get("offset")
+        limit = inp.get("limit")
+        tail = f" offset={offset} limit={limit}" if offset is not None or limit is not None else ""
+        return f"Read: {path}{tail}"
+    if name == "Grep":
+        pat = str(inp.get("pattern", ""))
+        path = str(inp.get("path", ""))
+        return f"Grep: pattern={_truncate(pat, 80)} path={path}"
+    if name == "Glob":
+        return f"Glob: {inp.get('pattern', '')}"
+    if name in ("Edit", "Write"):
+        return f"{name}: {inp.get('file_path', '')}"
+    # Generic fallback: dump key=value pairs, truncated.
+    parts = [f"{k}={_truncate(str(v), 80)}" for k, v in inp.items()]
+    return f"{name}: " + " ".join(parts) if parts else name
+
+
+def _extract_compact_trace(workdir: Path, session_uuid: str) -> str | None:
+    """Walk the Claude Code session JSONL and emit a turn-organized text trace.
+
+    The trace lists, per turn: the user prompt, every ``tool_use`` invocation
+    (Bash/Read/Grep/Glob/Edit/Write/…) with truncated inputs, and the agent's
+    final assistant text. ``tool_result`` content is omitted on purpose — the
+    summarizer needs the *actions*, not the noise of tool outputs.
+
+    Returns ``None`` if the JSONL is missing or unreadable.
+    """
+    log_path = _claude_session_log_path(workdir, session_uuid)
+    if not log_path.exists():
+        return None
+
+    turn_idx = 0
+    lines_out: list[str] = []
+    current_assistant_text: list[str] = []
+    try:
+        with log_path.open(encoding="utf-8") as f:
+            for raw_line in f:
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    ev = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                msg = ev.get("message") or {}
+                role = msg.get("role") or ev.get("type")
+                content = msg.get("content")
+
+                if role == "user":
+                    # Flush any pending assistant text from the prior turn.
+                    if current_assistant_text:
+                        joined = " ".join(current_assistant_text).strip()
+                        if joined:
+                            lines_out.append(f"  assistant: {_truncate(joined, _TRACE_FINAL_TEXT_CAP)}")
+                        current_assistant_text = []
+                    turn_idx += 1
+                    user_text = ""
+                    if isinstance(content, str):
+                        user_text = content
+                    elif isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                user_text = str(item.get("text", ""))
+                                break
+                    label = "setup" if turn_idx == 1 else f"query {turn_idx - 1}"
+                    lines_out.append("")
+                    lines_out.append(f"[Turn {turn_idx} — {label}]")
+                    if user_text:
+                        lines_out.append(f"  user: {_truncate(user_text, _TRACE_FINAL_TEXT_CAP)}")
+                elif role == "assistant" and isinstance(content, list):
+                    for item in content:
+                        if not isinstance(item, dict):
+                            continue
+                        itype = item.get("type")
+                        if itype == "tool_use":
+                            name = str(item.get("name", "?"))
+                            inp = item.get("input") or {}
+                            if isinstance(inp, dict):
+                                lines_out.append(f"  tool_use {_format_tool_input(name, inp)}")
+                            else:
+                                lines_out.append(f"  tool_use {name}")
+                        elif itype == "text":
+                            text = str(item.get("text", "")).strip()
+                            if text:
+                                current_assistant_text.append(text)
+    except OSError:
+        return None
+
+    if current_assistant_text:
+        joined = " ".join(current_assistant_text).strip()
+        if joined:
+            lines_out.append(f"  assistant: {_truncate(joined, _TRACE_FINAL_TEXT_CAP)}")
+
+    trace = "\n".join(lines_out).strip()
+    return trace or None
 
 
 def _scan_transcript_for_signals(
@@ -615,7 +658,7 @@ def run_condition(
         raise ValueError(f"unknown condition: {condition}")
     workdir = _build_condition_workdir(condition, workdir_root, pdf_source, skill_source, domain=domain)
     session_uuid = str(uuid.uuid4())
-    env = _env_for(condition, workdir)
+    env = os.environ.copy()
     logger.info(
         "starting session for %s/%s: workdir=%s session_id=%s",
         condition,

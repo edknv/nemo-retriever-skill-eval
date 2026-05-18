@@ -102,12 +102,17 @@ def _aggregate(
         metrics["judge_score_mean"] = sum(judge_scores) / len(judge_scores)
         metrics["judge_score_n"] = len(judge_scores)
 
+    tool_use_summary = next(
+        (r.tool_use_summary for r in setup_results if r.tool_use_summary), ""
+    )
+
     return {
         "run_name": run_name,
         "success": all(r.status == "ok" for r in results),
         "metrics": metrics,
         "tags": [results[0].condition, *extra_tags, f"n_queries={len(query_results)}"],
         "artifact_dir": artifact_dir,
+        "tool_use_summary": tool_use_summary,
     }
 
 
@@ -232,6 +237,20 @@ def write_summary_md(
                 cost=m.get("session_total_cost_usd", 0.0),
             )
         )
+
+    summary_blocks: list[tuple[str, str]] = []
+    for domain in sorted(rows_by_domain):
+        for row in rows_by_domain[domain]:
+            text = row.get("tool_use_summary") or ""
+            if text:
+                summary_blocks.append((str(row.get("run_name", "?")), text))
+    if summary_blocks:
+        lines += ["", "## Tool-use summaries", ""]
+        for run_name, text in summary_blocks:
+            lines.append(f"### {run_name}")
+            lines.append("")
+            lines.append(text)
+            lines.append("")
 
     diag_lines = []
     for row in overall_rows:

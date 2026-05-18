@@ -1,9 +1,39 @@
 # nemo-retriever-skill-eval
 
-A standalone harness that benchmarks a [Claude Code](https://docs.anthropic.com/en/docs/claude-code) skill
-against an off-the-shelf baseline on a labelled QA manifest. Pulled out of the
-`nemo-retriever` codebase as a reusable tool — the runner itself is skill-agnostic,
-the bundled example config is tuned for the `/nemo-retriever` skill.
+A standalone harness that benchmarks a [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
+skill against an off-the-shelf baseline on a labelled QA manifest.
+
+## Quickstart
+
+### 1. Clone the eval ground-truth manifest
+
+```bash
+git clone -b steve/agent_eval_sdg \
+    https://gitlab-master.nvidia.com/sthan/retriever-sdg-v3.git \
+    ~/git/retriever-sdg-v3
+```
+
+### 2. Install
+
+```bash
+uv sync                       # core harness
+uv sync --extra llm           # + LLM-as-judge support via litellm
+```
+
+[Claude Code](https://docs.anthropic.com/en/docs/claude-code) must be on `PATH`
+(`claude --version` should work).
+
+### 3. Run the c1_base baseline
+
+```bash
+cp src/nr_skill_eval/configs/skill_eval.yaml ~/my_skill_eval.yaml
+# Edit ~/my_skill_eval.yaml: set eval_manifest_path + pdf_dirs to paths under ~/git/retriever-sdg-v3
+
+uv run nr-skill-eval run --config ~/my_skill_eval.yaml --conditions c1_base
+```
+
+`c1_base` is the off-the-shelf baseline — no skill loaded, so `skill_source_dir`
+is not required.
 
 ## What it measures
 
@@ -11,11 +41,11 @@ For each `(condition, domain)` pair in your manifest, the harness spawns one
 `claude --print` session: turn 1 builds an index (the **setup turn**), turns
 2..N answer one labelled question each. Three conditions ship by default:
 
-| condition | skill loaded | slash commands | extra denies |
+| condition | skill loaded | slash commands | notes |
 |---|---|---|---|
-| `c1_base` | no | disabled | `Bash(*nemo_retriever*)`, retriever shim on PATH, HF cache redirected — agent falls back to `Read`/`Grep`/`pdftotext` |
-| `c2_retriever` | yes | yes | none — NL prompt, relies on the skill's description-based auto-discovery |
-| `c3_retriever_skill` | yes | yes | none — explicit `/<skill> ...` slash invocation |
+| `c1_base` | no | disabled | stock Claude Code with no skill, full access to whatever is on the host — measures the off-the-shelf experience |
+| `c2_retriever` | yes | yes | NL prompt, relies on the skill's description-based auto-discovery |
+| `c3_retriever_skill` | yes | yes | explicit `/<skill> ...` slash invocation |
 
 For every query turn the harness records:
 
@@ -26,50 +56,6 @@ For every query turn the harness records:
 
 Per-condition and per-(condition, domain) rollups are written to
 `session_summary.json` and `session_summary.md` in the timestamped session dir.
-
-## Installation
-
-This project uses [uv](https://docs.astral.sh/uv/) for environment + dependency
-management.
-
-```bash
-uv sync                       # core harness
-uv sync --extra llm           # + LLM-as-judge support via litellm
-```
-
-`uv sync` resolves the lockfile (creating one if absent) and installs the
-project into `.venv/` in editable mode. Re-run after editing `pyproject.toml`
-or to pick up a new extra.
-
-[Claude Code](https://docs.anthropic.com/en/docs/claude-code) must be on `PATH`
-(`claude --version` should work).
-
-## Run
-
-```bash
-# Copy the packaged config and edit it
-cp src/nr_skill_eval/configs/skill_eval.yaml ~/my_skill_eval.yaml
-# (set eval_manifest_path, pdf_dirs, skill_source_dir; optionally testdata_prefixes)
-
-uv run nr-skill-eval run --config ~/my_skill_eval.yaml
-
-# Or via python -m
-uv run python -m nr_skill_eval run --config ~/my_skill_eval.yaml
-
-# With the judge enabled (requires uv sync --extra llm and the judge API key env var)
-uv run --extra llm nr-skill-eval run --config ~/my_skill_eval.yaml
-
-# Subset of conditions / domains
-uv run nr-skill-eval run --config ~/my_skill_eval.yaml \
-    --conditions c1_base,c2_retriever \
-    --domains my_domain_a
-
-# Custom artifacts root
-uv run nr-skill-eval run --config ~/my_skill_eval.yaml --artifacts-root ./my_runs
-```
-
-`uv run` activates the project's virtualenv for the wrapped command, so you
-don't need to `source .venv/bin/activate` manually.
 
 ## Manifest schema
 
