@@ -2,12 +2,6 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from nr_skill_eval.cli import app
+from skill_eval.cli import app
 
-
-def main() -> None:
-    app()
-
-
-if __name__ == "__main__":
-    main()
+__all__ = ["app"]

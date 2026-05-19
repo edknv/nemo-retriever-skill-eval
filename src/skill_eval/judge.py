@@ -90,7 +90,7 @@ class LLMJudge:
             import litellm  # noqa: F401  (presence check; lazy-imported in judge())
         except ImportError as exc:  # pragma: no cover - exercised in install variants
             raise ImportError(
-                "LLMJudge requires `litellm`; install nemo-retriever-skill-eval[llm]."
+                "LLMJudge requires `litellm`; install skill-eval[llm]."
             ) from exc
         self.model = model
         self._api_base = api_base

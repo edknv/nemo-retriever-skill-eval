@@ -1,80 +1,68 @@
-# nemo-retriever-skill-eval
+# skill-eval
 
-A standalone harness that benchmarks a [Claude Code](https://docs.anthropic.com/en/docs/claude-code) skill
-against an off-the-shelf baseline on a labelled QA manifest. Pulled out of the
-`nemo-retriever` codebase as a reusable tool — the runner itself is skill-agnostic,
-the bundled example config is tuned for the `/nemo-retriever` skill.
+A harness that measures stock [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
+on a labelled QA manifest. For each domain in your manifest, it spawns one
+`claude --print` session: turn 1 builds an index over the domain's PDFs (the
+**setup turn**), turns 2..N answer one labelled question each. The agent has
+no skill loaded and `--disable-slash-commands` is set — it works only with
+stock tools (`Read`, `Grep`, `Bash`, etc.) plus whatever else is installed
+on the host.
 
-## What it measures
-
-For each `(condition, domain)` pair in your manifest, the harness spawns one
-`claude --print` session: turn 1 builds an index (the **setup turn**), turns
-2..N answer one labelled question each. Three conditions ship by default:
-
-| condition | skill loaded | slash commands | extra denies |
-|---|---|---|---|
-| `c1_base` | no | disabled | `Bash(*nemo_retriever*)`, retriever shim on PATH, HF cache redirected — agent falls back to `Read`/`Grep`/`pdftotext` |
-| `c2_retriever` | yes | yes | none — NL prompt, relies on the skill's description-based auto-discovery |
-| `c3_retriever_skill` | yes | yes | none — explicit `/<skill> ...` slash invocation |
+Every run is tagged as the single condition `c1_base`. The CLI no longer
+supports condition selection, skill loading, or slash-command variants.
 
 For every query turn the harness records:
 
 - `recall@{1,5,10}` against the manifest's `relevant_pages`
 - LLM-as-judge score on a 1–5 scale, against `answer` (optional, via `litellm`)
 - Anthropic agent-session cost + token breakdown (in / out / cache_read / cache_create)
-- Wall-time, success/failure status, whether the skill fired
+- Wall-time, success/failure status
 
-Per-condition and per-(condition, domain) rollups are written to
-`session_summary.json` and `session_summary.md` in the timestamped session dir.
+After each domain session, a separate Claude call summarizes the tool-use
+trace from the session JSONL so you can see *what* the agent did.
 
-## Installation
+Per-domain rollups land in `session_summary.json` and `session_summary.md`
+in the timestamped session dir.
 
-This project uses [uv](https://docs.astral.sh/uv/) for environment + dependency
-management.
+## Quickstart
+
+### 1. Install
 
 ```bash
 uv sync                       # core harness
 uv sync --extra llm           # + LLM-as-judge support via litellm
 ```
 
-`uv sync` resolves the lockfile (creating one if absent) and installs the
-project into `.venv/` in editable mode. Re-run after editing `pyproject.toml`
-or to pick up a new extra.
+[Claude Code](https://docs.anthropic.com/en/docs/claude-code) must be on
+`PATH` (`claude --version` should work).
 
-[Claude Code](https://docs.anthropic.com/en/docs/claude-code) must be on `PATH`
-(`claude --version` should work).
-
-## Run
+### 2. Run
 
 ```bash
 # Copy the packaged config and edit it
-cp src/nr_skill_eval/configs/skill_eval.yaml ~/my_skill_eval.yaml
-# (set eval_manifest_path, pdf_dirs, skill_source_dir; optionally testdata_prefixes)
+cp src/skill_eval/configs/skill_eval.yaml ~/my_skill_eval.yaml
+# (set eval_manifest_path and pdf_dirs; optionally testdata_prefixes)
 
-uv run nr-skill-eval run --config ~/my_skill_eval.yaml
-
-# Or via python -m
-uv run python -m nr_skill_eval run --config ~/my_skill_eval.yaml
-
-# With the judge enabled (requires uv sync --extra llm and the judge API key env var)
-uv run --extra llm nr-skill-eval run --config ~/my_skill_eval.yaml
-
-# Subset of conditions / domains
-uv run nr-skill-eval run --config ~/my_skill_eval.yaml \
-    --conditions c1_base,c2_retriever \
-    --domains my_domain_a
-
-# Custom artifacts root
-uv run nr-skill-eval run --config ~/my_skill_eval.yaml --artifacts-root ./my_runs
+uv run skill-eval run --config ~/my_skill_eval.yaml
 ```
 
 `uv run` activates the project's virtualenv for the wrapped command, so you
 don't need to `source .venv/bin/activate` manually.
 
+To run on a subset of domains:
+
+```bash
+uv run skill-eval run --config ~/my_skill_eval.yaml --domains my_domain_a
+```
+
+Supported `run` options are `--config`, `--eval-manifest`, `--domains`, and
+`--artifacts-root`. Old `--conditions`, `skill_source_dir`, `c2_retriever`,
+and `c3_retriever_skill` workflows are not part of this CLI.
+
 ## Manifest schema
 
 The harness expects a JSON list of dataset entries with these fields (see
-`src/nr_skill_eval/dataset.py:load_eval_manifest` for the exact loader):
+`src/skill_eval/dataset.py:load_eval_manifest` for the exact loader):
 
 ```json
 {
@@ -95,16 +83,17 @@ The harness expects a JSON list of dataset entries with these fields (see
 ## What's in this repo
 
 ```
-src/nr_skill_eval/
-  cli.py        — typer entrypoint; resolves config + spawns sessions
-  runner.py     — per-trial workdir builder + claude subprocess driver
-  dataset.py    — manifest + config loaders
-  report.py     — per-(condition, domain) aggregation + summary writers
-  score.py      — recall@k
-  judge.py      — LLM-as-judge wrapper (litellm-backed)
-  artifacts.py  — timestamped session dirs + JSON writers
-  configs/      — packaged example config
-  prompts/      — setup + per-trial prompt templates (NL and slash variants)
+src/skill_eval/
+  cli.py              — typer entrypoint; resolves config + spawns sessions
+  runner.py           — per-session workdir builder + claude subprocess driver
+  dataset.py          — manifest + config loaders
+  report.py           — per-domain aggregation + summary writers
+  score.py            — recall@k
+  judge.py            — LLM-as-judge wrapper (litellm-backed)
+  trace_summarizer.py — claude-CLI-backed tool-use narrator
+  artifacts.py        — timestamped session dirs + JSON writers
+  configs/            — packaged example config
+  prompts/            — setup + per-trial prompt templates
 ```
 
 ## License

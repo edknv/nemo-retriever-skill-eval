@@ -3,9 +3,9 @@ requires = ["setuptools>=78.1.1", "wheel>=0.46.2"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nemo-retriever-skill-eval"
+name = "skill-eval"
 version = "0.1.0"
-description = "Agent-skill evaluation harness: benchmarks a Claude Code skill against an off-the-shelf baseline on a labelled QA manifest."
+description = "Measures stock Claude Code on a labelled QA manifest."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -35,7 +35,7 @@ llm = [
 ]
 
 [project.scripts]
-nr-skill-eval = "nr_skill_eval.cli:app"
+skill-eval = "skill_eval.cli:app"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -44,4 +44,4 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-nr_skill_eval = ["configs/*.yaml", "prompts/*.j2"]
+skill_eval = ["configs/*.yaml", "prompts/*.j2"]
