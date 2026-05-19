@@ -13,7 +13,7 @@ from typing import Any, Iterable
 
 from skill_eval.artifacts import write_session_summary
 from skill_eval.dataset import DatasetEntry
-from skill_eval.runner import CONDITION, TrialResult
+from skill_eval.runner import BASE_CONDITION, TrialResult
 from skill_eval.score import recall_at_k
 
 METRIC_KS = (1, 5, 10)
@@ -72,7 +72,8 @@ def _aggregate(
         metrics["output_tokens"] = mean(r.output_tokens for r in query_results)
         metrics["cache_read_input_tokens"] = mean(r.cache_read_input_tokens for r in query_results)
         metrics["cache_creation_input_tokens"] = mean(r.cache_creation_input_tokens for r in query_results)
-        metrics["total_cost_usd"] = mean(r.total_cost_usd for r in query_results)
+        costed = [r.total_cost_usd for r in query_results if r.cost_available]
+        metrics["total_cost_usd"] = mean(costed) if costed else None
         metrics["duration_ms"] = mean(r.duration_ms for r in query_results)
     # When aggregating across multiple sessions there may be more than one setup
     # turn (one per domain); sum them so the "one-time cost" reflects the full run.
@@ -81,7 +82,8 @@ def _aggregate(
         metrics["setup_output_tokens"] = sum(r.output_tokens for r in setup_results)
         metrics["setup_cache_read_input_tokens"] = sum(r.cache_read_input_tokens for r in setup_results)
         metrics["setup_cache_creation_input_tokens"] = sum(r.cache_creation_input_tokens for r in setup_results)
-        metrics["setup_cost_usd"] = sum(r.total_cost_usd for r in setup_results)
+        setup_costed = [r.total_cost_usd for r in setup_results if r.cost_available]
+        metrics["setup_cost_usd"] = sum(setup_costed) if setup_costed else None
         metrics["setup_duration_ms"] = sum(r.duration_ms for r in setup_results)
         metrics["setup_status"] = (
             "ok" if all(r.status == "ok" for r in setup_results) else ",".join(r.status for r in setup_results)
@@ -90,7 +92,8 @@ def _aggregate(
     metrics["session_output_tokens"] = sum(r.output_tokens for r in results)
     metrics["session_cache_read_input_tokens"] = sum(r.cache_read_input_tokens for r in results)
     metrics["session_cache_creation_input_tokens"] = sum(r.cache_creation_input_tokens for r in results)
-    metrics["session_total_cost_usd"] = sum(r.total_cost_usd for r in results)
+    session_costed = [r.total_cost_usd for r in results if r.cost_available]
+    metrics["session_total_cost_usd"] = sum(session_costed) if session_costed else None
     metrics["num_query_turns"] = len(query_results)
     metrics["success_rate"] = sum(1 for r in results if r.status == "ok") / len(results)
     judge_scores = [r.judge_score for r in query_results if r.judge_score is not None]
@@ -106,10 +109,14 @@ def _aggregate(
         "run_name": run_name,
         "success": all(r.status == "ok" for r in results),
         "metrics": metrics,
-        "tags": [results[0].condition, *extra_tags, f"n_queries={len(query_results)}"],
+        "tags": [results[0].agent, results[0].condition, *extra_tags, f"n_queries={len(query_results)}"],
         "artifact_dir": artifact_dir,
         "tool_use_summary": tool_use_summary,
     }
+
+
+def _fmt_cost(value: Any) -> str:
+    return "—" if value is None else f"${float(value):.3f}"
 
 
 def _md_row(row: dict[str, Any]) -> str:
@@ -117,7 +124,7 @@ def _md_row(row: dict[str, Any]) -> str:
     judge_cell = f"{m['judge_score_mean']:.2f} (n={m.get('judge_score_n', 0)})" if "judge_score_mean" in m else "—"
     return (
         "| {name} | {sr:.2f} | {r1:.3f} | {r5:.3f} | {r10:.3f} | {judge} "
-        "| {ipt:.0f} | {opt:.0f} | {cr:.0f} | {cc:.0f} | ${cost:.3f} |"
+        "| {ipt:.0f} | {opt:.0f} | {cr:.0f} | {cc:.0f} | {cost} |"
     ).format(
         name=row.get("run_name", "?"),
         sr=m.get("success_rate", 0.0),
@@ -129,7 +136,7 @@ def _md_row(row: dict[str, Any]) -> str:
         opt=m.get("output_tokens", 0.0),
         cr=m.get("cache_read_input_tokens", 0.0),
         cc=m.get("cache_creation_input_tokens", 0.0),
-        cost=m.get("total_cost_usd", 0.0),
+        cost=_fmt_cost(m.get("total_cost_usd")),
     )
 
 
@@ -145,16 +152,19 @@ def write_summary_md(
     rows_by_domain: dict[str, list[dict[str, Any]]],
     overall_rows: list[dict[str, Any]],
     config: dict[str, Any],
+    agent: str,
+    model: str,
 ) -> Path:
     lines = [
         f"# skill_eval session summary — `{session_dir.name}`",
         "",
-        f"- Agent model: `{config.get('agent_model', '?')}`",
+        f"- Agent: `{agent}`",
+        f"- Agent model: `{model}`",
         f"- Per-trial budget: ${config.get('per_trial_budget_usd', '?')}",
         f"- Per-trial timeout: {config.get('per_trial_timeout_s', '?')}s",
         "",
-        "_Agent-session tokens only. Pipeline-side LLM calls (embeddings, VLM, etc.) are not instrumented._",
-        "_Each domain is one Claude session: turn 1 = setup, turns 2..N = query turns._",
+        "_Agent-session tokens only. Pipeline-side LLM calls are not instrumented._",
+        f"_Each domain is one {agent} session: turn 1 = setup, turns 2..N = query turns._",
         "",
         "## Overall (averaged across all queries in this run)",
         "",
@@ -188,13 +198,13 @@ def write_summary_md(
     for row in overall_rows:
         m = row.get("metrics", {})
         lines.append(
-            "| {name} | {st} | {ipt:.0f} | {opt:.0f} | {cr:.0f} | ${cost:.3f} | {ms:.0f} |".format(
+            "| {name} | {st} | {ipt:.0f} | {opt:.0f} | {cr:.0f} | {cost} | {ms:.0f} |".format(
                 name=row.get("run_name", "?"),
                 st=m.get("setup_status", "?"),
                 ipt=m.get("setup_input_tokens", 0),
                 opt=m.get("setup_output_tokens", 0),
                 cr=m.get("setup_cache_read_input_tokens", 0),
-                cost=m.get("setup_cost_usd", 0.0),
+                cost=_fmt_cost(m.get("setup_cost_usd")),
                 ms=m.get("setup_duration_ms", 0),
             )
         )
@@ -209,14 +219,14 @@ def write_summary_md(
     for row in overall_rows:
         m = row.get("metrics", {})
         lines.append(
-            "| {name} | {n} | {ipt} | {opt} | {cr} | {cc} | ${cost:.3f} |".format(
+            "| {name} | {n} | {ipt} | {opt} | {cr} | {cc} | {cost} |".format(
                 name=row.get("run_name", "?"),
                 n=m.get("num_query_turns", 0),
                 ipt=m.get("session_input_tokens", 0),
                 opt=m.get("session_output_tokens", 0),
                 cr=m.get("session_cache_read_input_tokens", 0),
                 cc=m.get("session_cache_creation_input_tokens", 0),
-                cost=m.get("session_total_cost_usd", 0.0),
+                cost=_fmt_cost(m.get("session_total_cost_usd")),
             )
         )
 
@@ -241,9 +251,11 @@ def write_summary_md(
 
 def write_summary(
     session_dir: Path,
-    results_by_key: dict[tuple[str, str], list[TrialResult]],
+    results_by_key: dict[tuple[str, str, str], list[TrialResult]],
     entries: list[DatasetEntry],
     config: dict[str, Any],
+    agent: str,
+    model: str,
     config_path: str,
 ) -> tuple[Path, Path]:
     entries_by_id = {e.entry_id: e for e in entries}
@@ -253,16 +265,18 @@ def write_summary(
     # Roll-up across all domains.
     all_results: list[TrialResult] = []
 
-    for (cond, domain), results in results_by_key.items():
+    for (agent_name, cond, domain), results in results_by_key.items():
         if not results:
             continue
         domain_rows[domain].append(
             _aggregate(
                 results,
                 entries_by_id,
-                run_name=f"{cond}/{domain}",
-                artifact_dir=str(Path("trials") / cond / domain) if domain else str(Path("trials") / cond),
-                extra_tags=(f"domain={domain}",) if domain else (),
+                run_name=f"{agent_name}/{cond}/{domain}",
+                artifact_dir=str(Path("trials") / agent_name / cond / domain)
+                if domain
+                else str(Path("trials") / agent_name / cond),
+                extra_tags=(f"agent={agent_name}", f"domain={domain}") if domain else (f"agent={agent_name}",),
             )
         )
         all_results.extend(results)
@@ -273,8 +287,8 @@ def write_summary(
             _aggregate(
                 all_results,
                 entries_by_id,
-                run_name=CONDITION,
-                artifact_dir=str(Path("trials") / CONDITION),
+                run_name=f"{agent}/{BASE_CONDITION}",
+                artifact_dir=str(Path("trials") / agent / BASE_CONDITION),
             )
         )
 
@@ -285,5 +299,5 @@ def write_summary(
         session_type="skill_eval",
         config_path=config_path,
     )
-    md_path = write_summary_md(session_dir, dict(domain_rows), overall_rows, config)
+    md_path = write_summary_md(session_dir, dict(domain_rows), overall_rows, config, agent=agent, model=model)
     return json_path, md_path
