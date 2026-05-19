@@ -1,26 +1,29 @@
-# skill-eval - benchmarking stock Claude Code over PDFs
+# skill-eval - benchmarking stock coding agents over PDFs
 
-`skill-eval run` measures how well stock [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
-answers labelled questions over a folder of PDFs. It does not load a skill,
-does not enable slash commands, and does not run multiple benchmark conditions.
+`skill-eval run` measures how well a stock coding agent answers labelled
+questions over a folder of PDFs. It currently supports two agent CLIs:
+`claude` and `codex`. It does not load a skill, does not enable slash commands,
+and does not run multiple benchmark conditions.
 
-Each domain in the manifest runs as one Claude Code session:
+Each domain in the manifest runs as one agent session:
 
 - Turn 1 is a setup turn over `./pdfs/`.
 - Turns 2..N answer one labelled question each.
 - Every result is tagged with the single condition `c1_base`.
-- Claude is launched with `--disable-slash-commands`.
+- Claude runs are launched with `--disable-slash-commands`.
+- Codex runs use `codex exec` and `codex exec resume`.
 
 For every query turn, the harness records:
 
 - `recall@{1,5,10}` against the manifest's `relevant_pages`.
 - Optional LLM-as-judge score on a 1-5 scale against the manifest's `answer`.
-- Anthropic agent-session cost and token breakdown.
+- Agent-session token breakdown when the selected CLI exposes it.
+- Agent-session cost for Claude. Codex cost is reported as unavailable.
 - Wall time, status, final answer, and the ranked pages the agent reported.
 
 After each domain session, an optional Claude call summarizes the tool-use trace
-from the Claude Code session JSONL. Per-domain and overall rollups are written
-to `session_summary.json` and `session_summary.md` in a timestamped artifact
+from the agent session JSONL. Per-domain and overall rollups are written to
+`session_summary.json` and `session_summary.md` in a timestamped artifact
 directory.
 
 ## Table Of Contents
@@ -40,14 +43,18 @@ directory.
 ## Prerequisites
 
 - `uv` for environment and dependency management.
-- `claude` on `PATH`; `claude --version` should work before starting a run.
-- A Claude account or API access configured for `claude --print`.
-- Claude Code autorun / permission access. The runner launches non-interactive
-  Claude Code subprocesses with `--permission-mode bypassPermissions` and
-  `--allow-dangerously-skip-permissions`.
+- At least one supported agent CLI on `PATH`: `claude` or `codex`.
+- Auth configured for whichever agent you run. For Claude, `claude --print`
+  should work. For Codex, `codex exec --help` should work and Codex auth must
+  already be configured.
+- Non-interactive tool execution access. Claude runs use
+  `--permission-mode bypassPermissions` and `--allow-dangerously-skip-permissions`.
+  Codex runs use `--dangerously-bypass-approvals-and-sandbox`.
+- Optional `claude` on `PATH` for the tool-use summarizer. Core Codex evals
+  still run without it; summarization is skipped.
 - Disk for per-domain scratch workdirs under `/tmp/skill_eval/` by default.
-  Each workdir contains a `pdfs/` symlink farm, `.claude/`, and whatever
-  search artifacts the agent creates. It is deleted after the domain session.
+  Each workdir contains a `pdfs/` symlink farm and whatever search artifacts
+  the agent creates. It is deleted after the domain session.
 - Optional `NVIDIA_API_KEY` for LLM-as-judge scoring via `litellm`.
 
 Install the core package:
@@ -72,8 +79,8 @@ uv sync --extra llm
 3. A YAML config binding the manifest to the PDF directories.
 
 The packaged config at `src/skill_eval/configs/skill_eval.yaml` provides
-defaults for model, budget, timeout, judge, and summarizer settings. You must
-fill in `eval_manifest_path` and `pdf_dirs`.
+defaults for agent selection, models, budget, timeout, judge, and summarizer
+settings. You must fill in `eval_manifest_path` and `pdf_dirs`.
 
 ## 1. Make The PDF Tree Reachable
 
@@ -171,7 +178,10 @@ pdf_dirs:
 testdata_prefixes:
   - test-data/vidore_v3/
 
-agent_model: claude-opus-4-7
+agent: claude
+agent_models:
+  claude: claude-opus-4-7
+  codex: gpt-5.5
 per_trial_budget_usd: 5.0
 per_trial_timeout_s: 600
 per_trial_workdir_root: /tmp/skill_eval
@@ -191,6 +201,10 @@ Things to check:
 
 - `pdf_dirs` keys must exactly match the manifest's `domain` values.
 - Each `pdf_dirs` value must be a directory containing PDFs, not a glob.
+- `agent` must be `claude` or `codex`. You can override it per run with
+  `--agent`.
+- `agent_models` maps each agent to its default model. You can override it per
+  run with `--model`.
 - If paraphrased prompts contain source-tree paths, add those prefixes to
   `testdata_prefixes` so prompt text resolves to `./pdfs/...` in the workdir.
 - The single-path key `pdf_dir` is still honored as a fallback for one-domain
@@ -206,6 +220,15 @@ uv run skill-eval run \
   --domains vidore_v3_finance_en
 ```
 
+Run the same domain with Codex:
+
+```bash
+uv run skill-eval run \
+  --config ~/datasets/skill_eval.yaml \
+  --agent codex \
+  --domains vidore_v3_finance_en
+```
+
 Run all domains in the manifest:
 
 ```bash
@@ -218,7 +241,7 @@ Run with judge support installed:
 uv run --extra llm skill-eval run --config ~/datasets/skill_eval.yaml
 ```
 
-Domains execute sequentially. Each domain is one Claude session, with one setup
+Domains execute sequentially. Each domain is one agent session, with one setup
 turn followed by one query turn per matching manifest entry.
 
 Example console shape:
@@ -227,9 +250,10 @@ Example console shape:
 Loaded 412 dataset entries.
 Domains in this run: ['vidore_v3_finance_en'] (52 entries total)
 Session dir: /repo/artifacts/skilleval_20260519_170000_UTC
-Starting session for vidore_v3_finance_en - setup + 52 query turns (pdfs=/datasets/...)
-  turn 1 [vidore_v3_finance_en] setup: status=ok tokens(in/out/cache_r)=... cost=$0.041 retrieved=0
-  turn 2 [vidore_v3_finance_en] entry_id=1 query_id=vidore_v3_finance_en:1:variant-1: status=ok ... judge=4
+Agent: claude  model=claude-opus-4-7  condition=c1_base
+Starting claude session for vidore_v3_finance_en - setup + 52 query turns (pdfs=/datasets/...)
+  turn 1 [claude/vidore_v3_finance_en] setup: status=ok tokens(in/out/cache_r)=... cost=$0.041 retrieved=0
+  turn 2 [claude/vidore_v3_finance_en] entry_id=1 query_id=vidore_v3_finance_en:1:variant-1: status=ok ... judge=4
 Recall for vidore_v3_finance_en: recall@1=0.115  recall@5=0.327  recall@10=0.481
 Cleaned up workdir for vidore_v3_finance_en
 ```
@@ -246,12 +270,14 @@ skill-eval run [OPTIONS]
 | `--eval-manifest PATH` | `cfg.eval_manifest_path` | Overrides the config manifest path for this invocation. |
 | `--domains LIST` | all domains in the manifest | Comma-separated subset. Unknown domains exit with code `2`. |
 | `--artifacts-root PATH` | `./artifacts/` | Where the timestamped session directory is created. |
+| `--agent claude|codex` | `cfg.agent` or `claude` | Selects the agent CLI to evaluate. |
+| `--model MODEL` | `cfg.agent_models.<agent>` | Overrides the selected agent's model for this invocation. |
 
 There is no condition selector. The CLI always runs the stock `c1_base` path.
 
-Configuration errors exit with code `2`, including missing `claude`, missing
-manifest path, malformed `testdata_prefixes`, unknown domain, or missing PDF
-directory.
+Configuration errors exit with code `2`, including missing selected agent CLI,
+missing manifest path, malformed `testdata_prefixes`, unknown domain, or
+missing PDF directory.
 
 ## Output Layout
 
@@ -263,11 +289,12 @@ Each run writes a timestamped session directory:
 |-- session_summary.json
 |-- session_summary.md
 `-- trials/
-    `-- c1_base/
-        `-- vidore_v3_finance_en/
-            |-- c1_base_vidore_v3_finance_en_setup_t1.json
-            |-- c1_base_vidore_v3_finance_en_e1_t2.json
-            `-- ...
+    `-- claude/
+        `-- c1_base/
+            `-- vidore_v3_finance_en/
+                |-- claude_c1_base_vidore_v3_finance_en_setup_t1.json
+                |-- claude_c1_base_vidore_v3_finance_en_e1_t2.json
+                `-- ...
 ```
 
 Per-trial JSON files serialize the `TrialResult` dataclass: status, duration,
@@ -275,9 +302,9 @@ token usage, cost, `final_answer`, `ranked_retrieved`, judge score, errors,
 domain, session id, and optional tool-use summary on the setup turn.
 
 Scratch workdirs under `per_trial_workdir_root` are deleted after each domain
-session finishes. The Claude Code transcript JSONL remains under
-`~/.claude/projects/` when available, and the harness reads it before cleanup
-for the optional tool-use summary.
+session finishes. Claude transcript JSONL lives under `~/.claude/projects/`;
+Codex transcript JSONL lives under `~/.codex/sessions/`. The harness reads the
+selected agent's transcript before cleanup for the optional tool-use summary.
 
 ## Interpreting The Summary
 
@@ -289,8 +316,9 @@ for the optional tool-use summary.
 - `judge`: mean judge score with sample size, or `-` when judging is disabled
   or unavailable.
 - `q_input`, `q_output`, `q_cache_read`, `q_cache_create`: mean per-query
-  Claude Code session token usage.
-- `q_cost`: mean per-query turn USD cost.
+  agent session token usage when available.
+- `q_cost`: mean per-query turn USD cost. This is available for Claude runs
+  and rendered as unavailable for Codex runs.
 
 The setup table reports one-time setup-turn cost summed across domains. The
 session totals table reports setup plus all query turns. If summarization is
@@ -299,8 +327,8 @@ strategy per domain.
 
 ## Troubleshooting
 
-**`Error: \`claude\` CLI is not on PATH`** - install Claude Code and confirm
-`which claude` resolves before running.
+**`Error: \`<agent>\` CLI is not on PATH`** - install or activate the selected
+agent CLI and confirm `which claude` or `which codex` resolves before running.
 
 **`config 'pdf_dirs' is missing an entry for domain '<X>'`** - add a matching
 key to `pdf_dirs`, or use `--domains` to skip that subset.
@@ -312,8 +340,9 @@ key to `pdf_dirs`, or use `--domains` to skip that subset.
 and recall metrics are written; the judge column is empty. Install with
 `uv sync --extra llm` and export the configured API key env var to enable it.
 
-**Tool-use summary is skipped** - the Claude Code session JSONL was not found
-or the summarizer call failed. Core trial results and metrics are unaffected.
+**Tool-use summary is skipped** - the selected agent's session JSONL was not
+found, or the summarizer call failed. Core trial results and metrics are
+unaffected.
 
 **Agent failed to write `./output.json`** - the trial JSON will show
 `status="extraction_failed"` and `extraction_method` as `missing` or
@@ -328,7 +357,7 @@ independent and artifact directories do not collide.
 ```text
 src/skill_eval/
   cli.py              - Typer entrypoint; resolves config and spawns sessions
-  runner.py           - workdir builder and Claude subprocess driver
+  runner.py           - workdir builder and agent subprocess driver
   dataset.py          - manifest and config loaders
   report.py           - aggregation and summary writers
   score.py            - recall@k

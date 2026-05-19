@@ -52,9 +52,12 @@ pdf_dirs: {}
 testdata_prefixes: []
 
 # ---------------------------------------------------------------------------
-# Agent model and per-trial limits
+# Agent selection, model, and per-trial limits
 # ---------------------------------------------------------------------------
-agent_model: claude-opus-4-7
+agent: claude
+agent_models:
+  claude: claude-opus-4-7
+  codex: gpt-5.5
 per_trial_budget_usd: 5.0
 per_trial_timeout_s: 600
 per_trial_workdir_root: /tmp/skill_eval
@@ -78,11 +81,10 @@ judge:
 # ---------------------------------------------------------------------------
 # Tool-use summarizer
 # ---------------------------------------------------------------------------
-# After each domain session, the harness reads the Claude Code session JSONL
-# and asks a strong Anthropic model to narrate what tools the agent called
-# and what strategy it took. Result is stamped onto the setup-turn
-# TrialResult and rendered as a "Tool-use summaries" section in
-# session_summary.md.
+# After each domain session, the harness reads the agent session JSONL and asks
+# a strong Anthropic model to narrate what tools the agent called and what
+# strategy it took. Result is stamped onto the setup-turn TrialResult and
+# rendered as a "Tool-use summaries" section in session_summary.md.
 #
 # Shells out to ``claude --print`` so it reuses Claude Code's existing auth
 # (subscription/OAuth) — no extra API key needed. Decoupled from the judge on

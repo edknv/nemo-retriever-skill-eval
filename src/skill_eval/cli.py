@@ -20,14 +20,16 @@ from skill_eval.artifacts import create_session_dir
 from skill_eval.dataset import DatasetEntry, load_config, load_eval_manifest
 from skill_eval.report import overall_recall, write_summary
 from skill_eval.runner import (
-    CONDITION,
-    _extract_compact_trace,
+    BASE_CONDITION,
+    DEFAULT_AGENT_MODELS,
+    SUPPORTED_AGENTS,
     cleanup_session_workdir,
+    extract_compact_trace,
     run_session,
     save_trial,
 )
 
-app = typer.Typer(help="Measure stock Claude Code on a labelled QA manifest.")
+app = typer.Typer(help="Measure stock coding agents on a labelled QA manifest.")
 logger = logging.getLogger(__name__)
 
 
@@ -86,14 +88,17 @@ def _build_judge(cfg: dict) -> Optional[Any]:
 def _build_trace_summarizer(cfg: dict) -> Optional[Any]:
     """Construct a ``TraceSummarizer`` from ``cfg['summarizer']`` or return ``None``.
 
-    Shells out to the ``claude`` CLI (same binary as the trial runs), so it
-    reuses Claude Code's auth — no extra API key required. Independent of the
-    judge: judging stays on a deterministic cheap model for cross-run score
+    Shells out to the ``claude`` CLI, so it reuses Claude Code's auth — no
+    extra API key required. Independent of the judged agent and judge model:
+    judging stays on a deterministic cheap model for cross-run score
     consistency; summarization can use a stronger narrator.
     """
     sum_cfg = cfg.get("summarizer") or {}
     if not sum_cfg.get("enabled", True):
         typer.echo("Trace summarizer disabled by config (summarizer.enabled=false).")
+        return None
+    if shutil.which("claude") is None:
+        typer.echo("Trace summarizer disabled: `claude` CLI is not on PATH.")
         return None
     from skill_eval.trace_summarizer import TraceSummarizer
 
@@ -102,6 +107,24 @@ def _build_trace_summarizer(cfg: dict) -> Optional[Any]:
     )
     typer.echo(f"Trace summarizer enabled: model={summarizer.model}")
     return summarizer
+
+
+def _resolve_agent(value: str) -> str:
+    agent = value.strip().lower()
+    if agent not in SUPPORTED_AGENTS:
+        raise typer.BadParameter(f"agent must be one of {', '.join(SUPPORTED_AGENTS)}")
+    return agent
+
+
+def _resolve_agent_model(cfg: dict, agent: str, override: Optional[str]) -> str:
+    if override:
+        return override
+    models = cfg.get("agent_models")
+    if isinstance(models, dict) and models.get(agent):
+        return str(models[agent])
+    if cfg.get("agent_model"):
+        return str(cfg["agent_model"])
+    return DEFAULT_AGENT_MODELS[agent]
 
 
 def _resolve_domain_label(entries: list[DatasetEntry], cfg: dict, domain: str) -> str:
@@ -139,14 +162,25 @@ def run_command(
     artifacts_root: Optional[Path] = typer.Option(
         None, "--artifacts-root", help="Override the artifact root; defaults to ./artifacts/"
     ),
+    agent_name: Optional[str] = typer.Option(
+        None,
+        "--agent",
+        help="Agent CLI to evaluate: claude or codex. Overrides config.agent.",
+    ),
+    model_override: Optional[str] = typer.Option(
+        None,
+        "--model",
+        help="Agent model override for this run.",
+    ),
 ) -> None:
     """Run the benchmark across the dataset's domains, sequentially."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    if shutil.which("claude") is None:
-        typer.echo("Error: `claude` CLI is not on PATH; install Claude Code first.", err=True)
-        raise typer.Exit(code=2)
 
     cfg = load_config(config)
+    agent = _resolve_agent(str(agent_name or cfg.get("agent") or "claude"))
+    if shutil.which(agent) is None:
+        typer.echo(f"Error: `{agent}` CLI is not on PATH.", err=True)
+        raise typer.Exit(code=2)
 
     manifest_path = eval_manifest or cfg.get("eval_manifest_path")
     if not manifest_path:
@@ -175,7 +209,7 @@ def run_command(
 
     workdir_root = Path(str(cfg.get("per_trial_workdir_root", "/tmp/skill_eval"))).expanduser()
     workdir_root.mkdir(parents=True, exist_ok=True)
-    model = str(cfg.get("agent_model", "claude-opus-4-7"))
+    model = _resolve_agent_model(cfg, agent, model_override)
     budget = float(cfg.get("per_trial_budget_usd", 5.0))
     timeout = int(cfg.get("per_trial_timeout_s", 600))
     testdata_prefixes_raw = cfg.get("testdata_prefixes") or []
@@ -190,11 +224,15 @@ def run_command(
     base_dir = str(artifacts_root) if artifacts_root else None
     session_dir = create_session_dir("skilleval", base_dir=base_dir)
     typer.echo(f"Session dir: {session_dir}")
+    typer.echo(f"Agent: {agent}  model={model}  condition={BASE_CONDITION}")
 
-    (session_dir / "config.yaml").write_text(yaml.safe_dump(cfg, default_flow_style=False), encoding="utf-8")
+    resolved_cfg = dict(cfg)
+    resolved_cfg["agent"] = agent
+    resolved_cfg["agent_model"] = model
+    (session_dir / "config.yaml").write_text(yaml.safe_dump(resolved_cfg, default_flow_style=False), encoding="utf-8")
 
-    # Results keyed (CONDITION, domain) so the report can break out per-domain numbers.
-    results_by_key: dict[tuple[str, str], list] = {}
+    # Results keyed (agent, condition, domain) so reports can compare agent runs.
+    results_by_key: dict[tuple[str, str, str], list] = {}
     for domain in domain_order:
         domain_entries = by_domain[domain]
         pdf_source = _resolve_pdf_source(cfg, domain)
@@ -207,10 +245,11 @@ def run_command(
             raise typer.Exit(code=2)
         domain_label = _resolve_domain_label(domain_entries, cfg, domain)
         typer.echo(
-            f"Starting session for {domain} — setup + {len(domain_entries)} query turns "
+            f"Starting {agent} session for {domain} — setup + {len(domain_entries)} query turns "
             f"(pdfs={pdf_source})"
         )
         workdir, results = run_session(
+            agent=agent,
             entries=domain_entries,
             workdir_root=workdir_root,
             pdf_source=pdf_source,
@@ -223,9 +262,9 @@ def run_command(
             testdata_prefixes=testdata_prefixes,
         )
         if summarizer is not None and results:
-            trace = _extract_compact_trace(workdir, results[0].session_id)
+            trace = extract_compact_trace(agent, workdir, results[0].session_id)
             if trace:
-                narrative = summarizer.summarize(condition=CONDITION, domain=domain, trace=trace)
+                narrative = summarizer.summarize(condition=f"{agent}/{BASE_CONDITION}", domain=domain, trace=trace)
                 if narrative:
                     for r in results:
                         if r.is_setup:
@@ -240,12 +279,13 @@ def run_command(
             save_trial(r, session_dir)
             kind = "setup" if r.is_setup else f"entry_id={r.entry_id} query_id={r.query_id}"
             judge_str = "" if r.is_setup or r.judge_score is None else f" judge={r.judge_score}"
+            cost_str = f"${r.total_cost_usd:.3f}" if r.cost_available else "n/a"
             typer.echo(
-                f"  turn {r.num_turns} [{domain}] {kind}: status={r.status} "
+                f"  turn {r.num_turns} [{agent}/{domain}] {kind}: status={r.status} "
                 f"tokens(in/out/cache_r)={r.input_tokens}/{r.output_tokens}/{r.cache_read_input_tokens} "
-                f"cost=${r.total_cost_usd:.3f} retrieved={len(r.ranked_retrieved)}{judge_str}"
+                f"cost={cost_str} retrieved={len(r.ranked_retrieved)}{judge_str}"
             )
-        results_by_key[(CONDITION, domain)] = results
+        results_by_key[(agent, BASE_CONDITION, domain)] = results
 
         entries_by_id = {e.entry_id: e for e in domain_entries}
         scores = overall_recall(results, entries_by_id)
@@ -264,7 +304,7 @@ def run_command(
         scored: list[int] = []
         errored = 0
         for domain in domain_order:
-            for r in results_by_key.get((CONDITION, domain), []):
+            for r in results_by_key.get((agent, BASE_CONDITION, domain), []):
                 if r.is_setup:
                     continue
                 if r.judge_score is not None:
@@ -281,7 +321,9 @@ def run_command(
         session_dir=session_dir,
         results_by_key=results_by_key,
         entries=entries,
-        config=cfg,
+        config=resolved_cfg,
+        agent=agent,
+        model=model,
         config_path=str(config) if config else "<packaged default>",
     )
     typer.echo(f"\nWrote {json_path}")
