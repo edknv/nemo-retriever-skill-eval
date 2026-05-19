@@ -5,7 +5,7 @@
 eval_manifest_path: ~/git/retriever-sdg-v3/runs/vidore_v3_agent_evals_20260513_batch_1/eval_manifest.json                                                                                           
                                                                                                                                                                                                     
 # REQUIRED — per-domain PDF roots (keys match manifest's `domain` field)                                                                                                                            
-pdf_dirs:                                                                                                                                                                                           
+pdf_dirs:
   vidore_v3_pharmaceuticals: ~/git/retriever-sdg-v3/test-data/vidorev3-fda/pdfs
   vidore_v3_finance_en: ~/git/retriever-sdg-v3/test-data/vidorev3-finance/pdfs
   vidore_v3_hr: ~/git/retriever-sdg-v3/test-data/vidorev3-hr/pdfs
@@ -22,12 +22,6 @@ agent_model: claude-opus-4-7
 per_trial_budget_usd: 5.0
 per_trial_timeout_s: 900
 per_trial_workdir_root: /tmp/skill_eval
-
-# Conditions in execution order
-conditions:
-  - c1_base
-  - c2_retriever
-  - c3_retriever_skill
 
 # LLM-as-judge — requires `litellm` installed and NVIDIA_API_KEY in env
 judge:

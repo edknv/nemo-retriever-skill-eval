@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Aggregate per-trial results into a per-condition / per-domain session summary."""
+"""Aggregate per-trial results into a per-domain session summary."""
 
 from __future__ import annotations
 
@@ -11,10 +11,10 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, Iterable
 
-from nr_skill_eval.artifacts import write_session_summary
-from nr_skill_eval.dataset import DatasetEntry
-from nr_skill_eval.runner import CONDITIONS, TrialResult
-from nr_skill_eval.score import recall_at_k
+from skill_eval.artifacts import write_session_summary
+from skill_eval.dataset import DatasetEntry
+from skill_eval.runner import CONDITION, TrialResult
+from skill_eval.score import recall_at_k
 
 METRIC_KS = (1, 5, 10)
 RECALL_KEYS = tuple(f"recall_{k}" for k in METRIC_KS)
@@ -93,14 +93,14 @@ def _aggregate(
     metrics["session_total_cost_usd"] = sum(r.total_cost_usd for r in results)
     metrics["num_query_turns"] = len(query_results)
     metrics["success_rate"] = sum(1 for r in results if r.status == "ok") / len(results)
-    metrics["retriever_used_rate"] = sum(1 for r in results if r.retriever_used_ever) / len(results)
-    skill_fired = [r.skill_fired for r in results if r.skill_fired is not None]
-    if skill_fired:
-        metrics["skill_fired_rate"] = sum(1 for x in skill_fired if x) / len(skill_fired)
     judge_scores = [r.judge_score for r in query_results if r.judge_score is not None]
     if judge_scores:
         metrics["judge_score_mean"] = sum(judge_scores) / len(judge_scores)
         metrics["judge_score_n"] = len(judge_scores)
+
+    tool_use_summary = next(
+        (r.tool_use_summary for r in setup_results if r.tool_use_summary), ""
+    )
 
     return {
         "run_name": run_name,
@@ -108,32 +108,19 @@ def _aggregate(
         "metrics": metrics,
         "tags": [results[0].condition, *extra_tags, f"n_queries={len(query_results)}"],
         "artifact_dir": artifact_dir,
+        "tool_use_summary": tool_use_summary,
     }
-
-
-def aggregate_condition(results: Iterable[TrialResult], entries_by_id: dict[int, DatasetEntry]) -> dict[str, Any]:
-    """Back-compat wrapper kept for callers that flatten per-domain results."""
-    results_list = list(results)
-    if not results_list:
-        return {}
-    return _aggregate(
-        results_list,
-        entries_by_id,
-        run_name=results_list[0].condition,
-        artifact_dir=str(Path("trials") / results_list[0].condition),
-    )
 
 
 def _md_row(row: dict[str, Any]) -> str:
     m = row.get("metrics", {})
     judge_cell = f"{m['judge_score_mean']:.2f} (n={m.get('judge_score_n', 0)})" if "judge_score_mean" in m else "—"
     return (
-        "| {cond} | {sr:.2f} | {retr:.2f} | {r1:.3f} | {r5:.3f} | {r10:.3f} | {judge} "
+        "| {name} | {sr:.2f} | {r1:.3f} | {r5:.3f} | {r10:.3f} | {judge} "
         "| {ipt:.0f} | {opt:.0f} | {cr:.0f} | {cc:.0f} | ${cost:.3f} |"
     ).format(
-        cond=row.get("run_name", "?"),
+        name=row.get("run_name", "?"),
         sr=m.get("success_rate", 0.0),
-        retr=m.get("retriever_used_rate", 0.0),
         r1=m.get("recall_1", 0.0),
         r5=m.get("recall_5", 0.0),
         r10=m.get("recall_10", 0.0),
@@ -147,10 +134,10 @@ def _md_row(row: dict[str, Any]) -> str:
 
 
 _MAIN_TABLE_HEADER = (
-    "| condition | success_rate | retr_used | recall@1 | recall@5 | recall@10 | judge | q_input | q_output "
+    "| run | success_rate | recall@1 | recall@5 | recall@10 | judge | q_input | q_output "
     "| q_cache_read | q_cache_create | q_cost |"
 )
-_MAIN_TABLE_DIVIDER = "|---|---|---|---|---|---|---|---|---|---|---|---|"
+_MAIN_TABLE_DIVIDER = "|---|---|---|---|---|---|---|---|---|---|---|"
 
 
 def write_summary_md(
@@ -167,7 +154,7 @@ def write_summary_md(
         f"- Per-trial timeout: {config.get('per_trial_timeout_s', '?')}s",
         "",
         "_Agent-session tokens only. Pipeline-side LLM calls (embeddings, VLM, etc.) are not instrumented._",
-        "_Each (condition, domain) is one Claude session: turn 1 = setup, turns 2..N = query turns._",
+        "_Each domain is one Claude session: turn 1 = setup, turns 2..N = query turns._",
         "",
         "## Overall (averaged across all queries in this run)",
         "",
@@ -193,16 +180,16 @@ def write_summary_md(
 
     lines += [
         "",
-        "## Setup turns (one-time cost per condition, summed across domains)",
+        "## Setup turns (one-time cost summed across domains)",
         "",
-        "| condition | status | setup_input | setup_output | setup_cache_read | setup_cost | setup_ms |",
+        "| run | status | setup_input | setup_output | setup_cache_read | setup_cost | setup_ms |",
         "|---|---|---|---|---|---|---|",
     ]
     for row in overall_rows:
         m = row.get("metrics", {})
         lines.append(
-            "| {cond} | {st} | {ipt:.0f} | {opt:.0f} | {cr:.0f} | ${cost:.3f} | {ms:.0f} |".format(
-                cond=row.get("run_name", "?"),
+            "| {name} | {st} | {ipt:.0f} | {opt:.0f} | {cr:.0f} | ${cost:.3f} | {ms:.0f} |".format(
+                name=row.get("run_name", "?"),
                 st=m.get("setup_status", "?"),
                 ipt=m.get("setup_input_tokens", 0),
                 opt=m.get("setup_output_tokens", 0),
@@ -216,14 +203,14 @@ def write_summary_md(
         "",
         "## Session totals (setup + all query turns)",
         "",
-        "| condition | query_turns | total_input | total_output | total_cache_read | total_cache_create | total_cost |",
+        "| run | query_turns | total_input | total_output | total_cache_read | total_cache_create | total_cost |",
         "|---|---|---|---|---|---|---|",
     ]
     for row in overall_rows:
         m = row.get("metrics", {})
         lines.append(
-            "| {cond} | {n} | {ipt} | {opt} | {cr} | {cc} | ${cost:.3f} |".format(
-                cond=row.get("run_name", "?"),
+            "| {name} | {n} | {ipt} | {opt} | {cr} | {cc} | ${cost:.3f} |".format(
+                name=row.get("run_name", "?"),
                 n=m.get("num_query_turns", 0),
                 ipt=m.get("session_input_tokens", 0),
                 opt=m.get("session_output_tokens", 0),
@@ -233,15 +220,19 @@ def write_summary_md(
             )
         )
 
-    diag_lines = []
-    for row in overall_rows:
-        m = row.get("metrics", {})
-        if "skill_fired_rate" in m:
-            diag_lines.append(f"- **{row['run_name']}**: skill_fired_rate={m['skill_fired_rate']:.2f}")
-    if diag_lines:
-        lines.append("")
-        lines.append("## Diagnostics")
-        lines.extend(diag_lines)
+    summary_blocks: list[tuple[str, str]] = []
+    for domain in sorted(rows_by_domain):
+        for row in rows_by_domain[domain]:
+            text = row.get("tool_use_summary") or ""
+            if text:
+                summary_blocks.append((str(row.get("run_name", "?")), text))
+    if summary_blocks:
+        lines += ["", "## Tool-use summaries", ""]
+        for run_name, text in summary_blocks:
+            lines.append(f"### {run_name}")
+            lines.append("")
+            lines.append(text)
+            lines.append("")
 
     out = session_dir / "session_summary.md"
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -257,10 +248,10 @@ def write_summary(
 ) -> tuple[Path, Path]:
     entries_by_id = {e.entry_id: e for e in entries}
 
-    # Per-(condition, domain) rows.
+    # Per-domain rows.
     domain_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    # Roll-up per condition across all domains.
-    by_condition: dict[str, list[TrialResult]] = defaultdict(list)
+    # Roll-up across all domains.
+    all_results: list[TrialResult] = []
 
     for (cond, domain), results in results_by_key.items():
         if not results:
@@ -274,19 +265,16 @@ def write_summary(
                 extra_tags=(f"domain={domain}",) if domain else (),
             )
         )
-        by_condition[cond].extend(results)
+        all_results.extend(results)
 
     overall_rows: list[dict[str, Any]] = []
-    for cond in CONDITIONS:
-        results = by_condition.get(cond, [])
-        if not results:
-            continue
+    if all_results:
         overall_rows.append(
             _aggregate(
-                results,
+                all_results,
                 entries_by_id,
-                run_name=cond,
-                artifact_dir=str(Path("trials") / cond),
+                run_name=CONDITION,
+                artifact_dir=str(Path("trials") / CONDITION),
             )
         )
 
