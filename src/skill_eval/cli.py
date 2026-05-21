@@ -25,6 +25,7 @@ from skill_eval.runner import (
     BASE_CONDITION,
     DEFAULT_AGENT_MODELS,
     SUPPORTED_AGENTS,
+    UNSCORABLE_JUDGE_ERRORS,
     TrialResult,
     _apply_judge,
     cleanup_session_workdir,
@@ -346,13 +347,20 @@ def _needs_rescore(trial: dict[str, Any]) -> bool:
     Setup turns are never judged. ``judge_score`` is normally an int in 1-5 or
     ``None``; we treat ``0`` the same as ``None`` since the user reported a
     failed judge surfacing as a zero score.
+
+    Intrinsically unscorable trials (missing ground truth, empty candidate)
+    are terminal and must not be retried — otherwise every rescore wastes a
+    pass on entries that can never produce a score.
     """
     if trial.get("is_setup"):
+        return False
+    judge_error = trial.get("judge_error") or ""
+    if judge_error in UNSCORABLE_JUDGE_ERRORS:
         return False
     score = trial.get("judge_score")
     if score is None or score == 0:
         return True
-    if trial.get("judge_error"):
+    if judge_error:
         return True
     return False
 

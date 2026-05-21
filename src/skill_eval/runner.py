@@ -749,13 +749,25 @@ def _run_one_turn(
     return result
 
 
+UNSCORABLE_JUDGE_ERRORS: frozenset[str] = frozenset({"no_ground_truth", "empty_candidate"})
+
+
 def _apply_judge(judge: Any, entry: DatasetEntry, result: TrialResult) -> None:
     """Score ``result.final_answer`` against ``entry.ground_truth_answer``.
 
-    Mutates the result in place. Skips silently when the judge is unset, the
-    ground-truth answer is empty, or the trial didn't produce a final answer.
+    Mutates the result in place. When the judge is unset we skip silently
+    (judging just isn't configured). When the entry has no ground-truth answer
+    or the trial produced no final answer the result is intrinsically
+    unscorable; we record that on ``judge_error`` so rescore passes can
+    recognize it as terminal instead of retrying forever.
     """
-    if judge is None or not entry.ground_truth_answer or not result.final_answer:
+    if judge is None:
+        return
+    if not entry.ground_truth_answer:
+        result.judge_error = "no_ground_truth"
+        return
+    if not result.final_answer:
+        result.judge_error = "empty_candidate"
         return
     try:
         verdict = judge.judge(
