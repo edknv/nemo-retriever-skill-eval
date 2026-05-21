@@ -76,11 +76,16 @@ def _build_judge(cfg: dict) -> Optional[Any]:
     except ImportError as exc:
         typer.echo(f"Judge disabled: failed to import LLMJudge ({exc}). Install skill-eval[llm].")
         return None
-    judge = LLMJudge.from_kwargs(
-        model=str(judge_cfg.get("model", "nvidia_nim/mistralai/mixtral-8x22b-instruct-v0.1")),
+    judge_kwargs: dict[str, Any] = dict(
+        model=str(judge_cfg.get("model", "openai/nvidia/nvidia/llama-3.3-nemotron-super-49b-v1.5")),
         api_base=judge_cfg.get("api_base"),
         api_key=api_key,
     )
+    if "max_tokens" in judge_cfg:
+        judge_kwargs["max_tokens"] = int(judge_cfg["max_tokens"])
+    if "temperature" in judge_cfg:
+        judge_kwargs["temperature"] = float(judge_cfg["temperature"])
+    judge = LLMJudge.from_kwargs(**judge_kwargs)
     typer.echo(f"Judge enabled: model={judge.model}")
     return judge
 

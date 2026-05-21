@@ -55,7 +55,7 @@ Reference answer: {reference}
 
 Candidate answer: {candidate}"""
 
-_DEFAULT_MODEL = "nvidia_nim/mistralai/mixtral-8x22b-instruct-v0.1"
+_DEFAULT_MODEL = "openai/nvidia/nvidia/llama-3.3-nemotron-super-49b-v1.5"
 
 
 @dataclass
@@ -83,7 +83,7 @@ class LLMJudge:
         num_retries: int = 3,
         timeout: float = 120.0,
         temperature: float = 0.0,
-        max_tokens: int = 256,
+        max_tokens: int = 32768,
         extra_params: Optional[dict[str, Any]] = None,
     ):
         try:
@@ -141,6 +141,9 @@ class LLMJudge:
 def _parse_judge_response(raw: str) -> JudgeResult:
     """Parse the judge's JSON response into a ``JudgeResult``."""
     text = raw.strip()
+    # Reasoning models (e.g. Nemotron Super) emit <think>...</think> before the
+    # final answer. Strip it so json.loads sees only the JSON payload.
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
     text = re.sub(r"\s*```$", "", text, flags=re.MULTILINE)
     text = text.strip()

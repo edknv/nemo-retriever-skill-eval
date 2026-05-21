@@ -55,7 +55,13 @@ directory.
 - Disk for per-domain scratch workdirs under `/tmp/skill_eval/` by default.
   Each workdir contains a `pdfs/` symlink farm and whatever search artifacts
   the agent creates. It is deleted after the domain session.
-- Optional `NVIDIA_API_KEY` for LLM-as-judge scoring via `litellm`.
+- Optional `NVIDIA_API_KEY` for LLM-as-judge scoring via `litellm`. The
+  default config targets `https://inference-api.nvidia.com/v1`, so the key
+  must be an **inference.nvidia.com** key (these start with `sk-***`). NVIDIA
+  also issues keys from **build.nvidia.com** (those start with `nvapi-***`
+  and only work against `https://integrate.api.nvidia.com/v1`) — the two are
+  not interchangeable, and pairing the wrong key with the wrong `api_base`
+  returns 401.
 
 Install the core package:
 
@@ -188,9 +194,11 @@ per_trial_workdir_root: /tmp/skill_eval
 
 judge:
   enabled: true
-  model: nvidia_nim/mistralai/mixtral-8x22b-instruct-v0.1
-  api_base: https://integrate.api.nvidia.com/v1
+  model: openai/nvidia/nvidia/llama-3.3-nemotron-super-49b-v1.5
+  api_base: https://inference-api.nvidia.com/v1
   api_key_env: NVIDIA_API_KEY
+  max_tokens: 32768
+  temperature: 0.0
 
 summarizer:
   enabled: true
@@ -339,6 +347,13 @@ key to `pdf_dirs`, or use `--domains` to skip that subset.
 **Judge is disabled** - if `$NVIDIA_API_KEY` is unset, the run still succeeds
 and recall metrics are written; the judge column is empty. Install with
 `uv sync --extra llm` and export the configured API key env var to enable it.
+
+**Judge returns 401** - the default `judge.api_base` is
+`https://inference-api.nvidia.com/v1`, which only accepts inference.nvidia.com
+keys (`sk-***`). If your key starts with `nvapi-***`, it's a build.nvidia.com
+key and belongs against `https://integrate.api.nvidia.com/v1` instead.
+Match key prefix to `api_base`, or swap the `api_base` to the endpoint your
+key was issued for.
 
 **Tool-use summary is skipped** - the selected agent's session JSONL was not
 found, or the summarizer call failed. Core trial results and metrics are

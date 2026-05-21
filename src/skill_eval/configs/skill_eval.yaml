@@ -72,11 +72,24 @@ per_trial_workdir_root: /tmp/skill_eval
 #
 # Keep this on a stable, deterministic model so scores stay comparable across
 # runs. Judging fires once per query × domain, so cheap matters.
+#
+# API key note: ``api_base: https://inference-api.nvidia.com/v1`` requires a
+# key from inference.nvidia.com — these start with ``sk-***``. This is NOT
+# the same as a build.nvidia.com key (those start with ``nvapi-***`` and
+# target ``integrate.api.nvidia.com``). Using the wrong key against the wrong
+# endpoint returns 401. Both can live in ``NVIDIA_API_KEY``; just make sure
+# the value you export matches the ``api_base`` below.
 judge:
   enabled: true
-  model: nvidia_nim/mistralai/mixtral-8x22b-instruct-v0.1
-  api_base: https://integrate.api.nvidia.com/v1
+  model: openai/nvidia/nvidia/llama-3.3-nemotron-super-49b-v1.5
+  api_base: https://inference-api.nvidia.com/v1
   api_key_env: NVIDIA_API_KEY
+  # Nemotron Super is a reasoning model that emits a <think> block before the
+  # final JSON, so it needs a large token budget. NVIDIA's evaluator tutorial
+  # uses 32768 for the same model.
+  max_tokens: 32768
+  # Low/zero temperature keeps scoring reproducible across runs.
+  temperature: 0.0
 
 # ---------------------------------------------------------------------------
 # Tool-use summarizer

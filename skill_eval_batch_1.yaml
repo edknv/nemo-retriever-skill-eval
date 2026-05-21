@@ -29,6 +29,8 @@ per_trial_workdir_root: /tmp/skill_eval
 # LLM-as-judge — requires `litellm` installed and NVIDIA_API_KEY in env
 judge:
   enabled: true
-  model: nvidia_nim/mistralai/mixtral-8x22b-instruct-v0.1
-  api_base: https://integrate.api.nvidia.com/v1
+  model: openai/nvidia/nvidia/llama-3.3-nemotron-super-49b-v1.5
+  api_base: https://inference-api.nvidia.com/v1
   api_key_env: NVIDIA_API_KEY
+  max_tokens: 32768
+  temperature: 0.0
