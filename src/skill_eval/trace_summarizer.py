@@ -4,9 +4,9 @@
 
 """LLM-generated tool-use summaries via the ``claude`` CLI.
 
-Reads a compact trace of one Claude Code session (setup turn + N query turns)
-and asks a strong Anthropic model to narrate what the agent did: which tools
-it called, in what order, what strategy it took, where it improvised.
+Reads a compact trace of one agent session (setup turn + N query turns) and
+asks a strong Anthropic model to narrate what the agent did: which tools it
+called, in what order, what strategy it took, where it improvised.
 
 Shells out to ``claude --print`` so it reuses Claude Code's existing auth
 (subscription/OAuth) — no extra ``ANTHROPIC_API_KEY`` needed. Each call runs
@@ -19,13 +19,11 @@ from __future__ import annotations
 import logging
 import subprocess
 import tempfile
-from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 _SUMMARIZER_PROMPT_TEMPLATE = """\
-You are summarizing the tool-use trace of a Claude Code agent that just ran an
+You are summarizing the tool-use trace of a coding agent that just ran an
 information-retrieval benchmark over a corpus of PDFs.
 
 Produce a concise markdown narrative with these sections:

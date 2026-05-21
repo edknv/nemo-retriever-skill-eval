@@ -1,18 +1,16 @@
 # skill_eval run config
 #
-# This file is loaded by ``nr-skill-eval run`` when ``--config`` is not passed.
+# This file is loaded by ``skill-eval run`` when ``--config`` is not passed.
 # It carries working defaults for everything EXCEPT the dataset bindings
-# (manifest path, PDF directories) and the skill under test, which must be
-# supplied by the user.
+# (manifest path, PDF directories), which must be supplied by the user.
 #
 # Recommended workflow:
 #   1. Copy this file next to your dataset checkout:
-#        cp src/nr_skill_eval/configs/skill_eval.yaml ~/path/to/datasets/skill_eval.yaml
-#   2. Fill in ``eval_manifest_path``, ``pdf_dirs``, ``skill_source_dir``
-#      (and ``testdata_prefixes`` if your manifest hard-codes dataset paths
-#      in user-facing text).
+#        cp src/skill_eval/configs/skill_eval.yaml ~/path/to/datasets/skill_eval.yaml
+#   2. Fill in ``eval_manifest_path``, ``pdf_dirs`` (and ``testdata_prefixes``
+#      if your manifest hard-codes dataset paths in user-facing text).
 #   3. Run:
-#        nr-skill-eval run --config ~/path/to/datasets/skill_eval.yaml
+#        skill-eval run --config ~/path/to/datasets/skill_eval.yaml
 
 # ---------------------------------------------------------------------------
 # REQUIRED — agent-eval manifest
@@ -44,17 +42,6 @@ eval_manifest_path: null
 pdf_dirs: {}
 
 # ---------------------------------------------------------------------------
-# REQUIRED — skill under test
-# ---------------------------------------------------------------------------
-# Path to the Claude Code skill directory (the folder that contains
-# ``SKILL.md`` and any ``references/`` subdir). The runner copies this into
-# each c2/c3 trial workdir's ``.claude/skills/<skill-name>/``.
-#
-# Example:
-#   skill_source_dir: ~/code/myproject/.claude/skills/my-skill
-skill_source_dir: null
-
-# ---------------------------------------------------------------------------
 # OPTIONAL — path-prefix rewrites for paraphrased prompts
 # ---------------------------------------------------------------------------
 # Some manifests' paraphrased prompts hard-code dataset-source paths in the
@@ -65,22 +52,15 @@ skill_source_dir: null
 testdata_prefixes: []
 
 # ---------------------------------------------------------------------------
-# Agent model and per-trial limits
+# Agent selection, model, and per-trial limits
 # ---------------------------------------------------------------------------
-agent_model: claude-opus-4-7
+agent: claude
+agent_models:
+  claude: claude-opus-4-7
+  codex: gpt-5.5
 per_trial_budget_usd: 5.0
 per_trial_timeout_s: 600
 per_trial_workdir_root: /tmp/skill_eval
-
-# ---------------------------------------------------------------------------
-# Conditions to run, in execution order
-# ---------------------------------------------------------------------------
-# Each (condition, domain) workdir is deleted after it finishes, so only one
-# LanceDB is on disk at a time. Override on the CLI with ``--conditions``.
-conditions:
-  - c1_base               # skill blocked → off-the-shelf baseline
-  - c2_retriever          # skill available, NL prompt, description-based auto-discovery
-  - c3_retriever_skill    # skill available, explicit slash-command invocation
 
 # ---------------------------------------------------------------------------
 # LLM-as-judge
@@ -91,7 +71,7 @@ conditions:
 # note. Set ``enabled: false`` to opt out explicitly.
 #
 # Keep this on a stable, deterministic model so scores stay comparable across
-# runs. Judging fires once per query × condition × domain, so cheap matters.
+# runs. Judging fires once per query × domain, so cheap matters.
 judge:
   enabled: true
   model: nvidia_nim/mistralai/mixtral-8x22b-instruct-v0.1
@@ -101,17 +81,16 @@ judge:
 # ---------------------------------------------------------------------------
 # Tool-use summarizer
 # ---------------------------------------------------------------------------
-# After each (condition, domain) session, the harness reads the Claude Code
-# session JSONL and asks a strong Anthropic model to narrate what tools the
-# agent called and what strategy it took. Result is stamped onto the setup-
-# turn TrialResult and rendered as a "Tool-use summaries" section in
-# session_summary.md.
+# After each domain session, the harness reads the agent session JSONL and asks
+# a strong Anthropic model to narrate what tools the agent called and what
+# strategy it took. Result is stamped onto the setup-turn TrialResult and
+# rendered as a "Tool-use summaries" section in session_summary.md.
 #
 # Shells out to ``claude --print`` so it reuses Claude Code's existing auth
 # (subscription/OAuth) — no extra API key needed. Decoupled from the judge on
-# purpose: this fires only once per session (~3× per run), so a stronger
-# narrator (Claude Opus by default) is cheap enough, while judging stays on
-# its own deterministic model above.
+# purpose: this fires only once per session, so a stronger narrator (Claude
+# Opus by default) is cheap enough, while judging stays on its own
+# deterministic model above.
 summarizer:
   enabled: true
   model: claude-opus-4-7

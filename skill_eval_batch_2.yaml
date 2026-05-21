@@ -17,17 +17,14 @@ testdata_prefixes:
   - test-data/vidorev3-finance/pdfs
   - test-data/vidorev3-hr/pdfs
 
-# Agent model + per-trial limits
-agent_model: claude-opus-4-7
+# Agent selection, model, and per-trial limits
+agent: codex
+agent_models:
+  claude: claude-opus-4-7
+  codex: gpt-5.5
 per_trial_budget_usd: 5.0
 per_trial_timeout_s: 900
 per_trial_workdir_root: /tmp/skill_eval
-
-# Conditions in execution order
-conditions:
-  - c1_base
-  - c2_retriever
-  - c3_retriever_skill
 
 # LLM-as-judge — requires `litellm` installed and NVIDIA_API_KEY in env
 judge:

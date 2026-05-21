@@ -1,96 +1,371 @@
-# nemo-retriever-skill-eval
+# skill-eval - benchmarking stock coding agents over PDFs
 
-A standalone harness that benchmarks a [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
-skill against an off-the-shelf baseline on a labelled QA manifest.
+`skill-eval run` measures how well a stock coding agent answers labelled
+questions over a folder of PDFs. It currently supports two agent CLIs:
+`claude` and `codex`. It does not load a skill, does not enable slash commands,
+and does not run multiple benchmark conditions.
 
-## Quickstart
+Each domain in the manifest runs as one agent session:
 
-### 1. Clone the eval ground-truth manifest
+- Turn 1 is a setup turn over `./pdfs/`.
+- Turns 2..N answer one labelled question each.
+- Every result is tagged with the single condition `c1_base`.
+- Claude runs are launched with `--disable-slash-commands`.
+- Codex runs use `codex exec` and `codex exec resume`.
+
+For every query turn, the harness records:
+
+- `recall@{1,5,10}` against the manifest's `relevant_pages`.
+- Optional LLM-as-judge score on a 1-5 scale against the manifest's `answer`.
+- Agent-session token breakdown when the selected CLI exposes it.
+- Agent-session cost for Claude. Codex cost is reported as unavailable.
+- Wall time, status, final answer, and the ranked pages the agent reported.
+
+After each domain session, an optional Claude call summarizes the tool-use trace
+from the agent session JSONL. Per-domain and overall rollups are written to
+`session_summary.json` and `session_summary.md` in a timestamped artifact
+directory.
+
+## Table Of Contents
+
+- [Prerequisites](#prerequisites)
+- [Inputs](#inputs)
+- [1. Make the PDF tree reachable](#1-make-the-pdf-tree-reachable)
+- [2. Supply an agent-eval manifest](#2-supply-an-agent-eval-manifest)
+- [3. Author your config](#3-author-your-config)
+- [4. Run the benchmark](#4-run-the-benchmark)
+- [CLI reference](#cli-reference)
+- [Output layout](#output-layout)
+- [Interpreting the summary](#interpreting-the-summary)
+- [Troubleshooting](#troubleshooting)
+- [Repository layout](#repository-layout)
+
+## Prerequisites
+
+- `uv` for environment and dependency management.
+- At least one supported agent CLI on `PATH`: `claude` or `codex`.
+- Auth configured for whichever agent you run. For Claude, `claude --print`
+  should work. For Codex, `codex exec --help` should work and Codex auth must
+  already be configured.
+- Non-interactive tool execution access. Claude runs use
+  `--permission-mode bypassPermissions` and `--allow-dangerously-skip-permissions`.
+  Codex runs use `--dangerously-bypass-approvals-and-sandbox`.
+- Optional `claude` on `PATH` for the tool-use summarizer. Core Codex evals
+  still run without it; summarization is skipped.
+- Disk for per-domain scratch workdirs under `/tmp/skill_eval/` by default.
+  Each workdir contains a `pdfs/` symlink farm and whatever search artifacts
+  the agent creates. It is deleted after the domain session.
+- Optional `NVIDIA_API_KEY` for LLM-as-judge scoring via `litellm`.
+
+Install the core package:
 
 ```bash
-git clone -b steve/agent_eval_sdg \
-    https://gitlab-master.nvidia.com/sthan/retriever-sdg-v3.git \
-    ~/git/retriever-sdg-v3
+uv sync
 ```
 
-### 2. Install
+Install judge support:
 
 ```bash
-uv sync                       # core harness
-uv sync --extra llm           # + LLM-as-judge support via litellm
+uv sync --extra llm
 ```
 
-[Claude Code](https://docs.anthropic.com/en/docs/claude-code) must be on `PATH`
-(`claude --version` should work).
+## Inputs
 
-### 3. Run the c1_base baseline
+`skill-eval` needs three caller-supplied inputs:
 
-```bash
-cp src/nr_skill_eval/configs/skill_eval.yaml ~/my_skill_eval.yaml
-# Edit ~/my_skill_eval.yaml: set eval_manifest_path + pdf_dirs to paths under ~/git/retriever-sdg-v3
+1. A directory of PDFs for each manifest domain.
+2. An agent-eval manifest JSON list describing queries, prompts, ground-truth
+   pages, and ground-truth answers.
+3. A YAML config binding the manifest to the PDF directories.
 
-uv run nr-skill-eval run --config ~/my_skill_eval.yaml --conditions c1_base
+The packaged config at `src/skill_eval/configs/skill_eval.yaml` provides
+defaults for agent selection, models, budget, timeout, judge, and summarizer
+settings. You must fill in `eval_manifest_path` and `pdf_dirs`.
+
+## 1. Make The PDF Tree Reachable
+
+The runner does not copy PDFs. For each domain, it creates a scratch workdir
+and symlinks every `*.pdf` from the configured source directory into
+`<workdir>/pdfs/`.
+
+For ViDoRe v3, a typical PDF root is split by domain:
+
+```text
+vidore_v3_computer_science
+vidore_v3_energy
+vidore_v3_finance_en
+vidore_v3_finance_fr
+vidore_v3_hr
+vidore_v3_industrial
+vidore_v3_pharmaceuticals
+vidore_v3_physics
 ```
 
-`c1_base` is the off-the-shelf baseline — no skill loaded, so `skill_source_dir`
-is not required.
+The `pdf_dirs` keys in your config must match the `domain` strings in the
+manifest exactly. They do not need to match filesystem directory names.
 
-## What it measures
+## 2. Supply An Agent-Eval Manifest
 
-For each `(condition, domain)` pair in your manifest, the harness spawns one
-`claude --print` session: turn 1 builds an index (the **setup turn**), turns
-2..N answer one labelled question each. Three conditions ship by default:
+The manifest is a JSON list. Each item describes one query. The loader is
+dataset-agnostic and accepts these fields:
 
-| condition | skill loaded | slash commands | notes |
-|---|---|---|---|
-| `c1_base` | no | disabled | stock Claude Code with no skill, full access to whatever is on the host — measures the off-the-shelf experience |
-| `c2_retriever` | yes | yes | NL prompt, relies on the skill's description-based auto-discovery |
-| `c3_retriever_skill` | yes | yes | explicit `/<skill> ...` slash invocation |
+| Field | Type | Purpose |
+|---|---|---|
+| `original_query` | string | Raw user question, used for judging context. |
+| `sdg_prompt_candidates.candidates` | list of `{variant_id, prompt}` | Paraphrased prompt variants. |
+| `sdg_prompt_validation.selected_variant_id` | int, optional | Chosen prompt variant; falls back to the first candidate. |
+| `relevant_pages` | list of `{doc_id, page_number_in_doc, score}` | Ground-truth pages for recall. |
+| `answer` | string | Ground-truth answer for the optional judge. |
+| `domain` | string | Joins the entry to a `pdf_dirs` key. |
+| `prompt_taxonomy.domain_label` | string | Human-readable label injected into the setup prompt. |
+| `primary_eval_id` | string, optional | Stable query id; falls back to `eval_base_id`, then list position. |
 
-For every query turn the harness records:
+The newer `scenario_prompt_candidates` and `scenario_prompt_validation` keys
+are accepted as aliases. Entries with `prompt_export_status` not in
+`(None, "exported")` are skipped, as are entries with no usable paraphrased
+prompt.
 
-- `recall@{1,5,10}` against the manifest's `relevant_pages`
-- LLM-as-judge score on a 1–5 scale, against `answer` (optional, via `litellm`)
-- Anthropic agent-session cost + token breakdown (in / out / cache_read / cache_create)
-- Wall-time, success/failure status, whether the skill fired
-
-Per-condition and per-(condition, domain) rollups are written to
-`session_summary.json` and `session_summary.md` in the timestamped session dir.
-
-## Manifest schema
-
-The harness expects a JSON list of dataset entries with these fields (see
-`src/nr_skill_eval/dataset.py:load_eval_manifest` for the exact loader):
+Example entry:
 
 ```json
 {
-  "primary_eval_id": "<domain>:<n>:<variant>",
-  "original_query": "What is …?",
-  "sdg_prompt_candidates": {"candidates": [{"variant_id": 0, "prompt": "…paraphrased…"}]},
-  "sdg_prompt_validation": {"selected_variant_id": 0},
-  "relevant_pages": [{"doc_id": "Foo_Report", "page_number_in_doc": 12, "score": 1}],
-  "answer": "<ground-truth answer text>",
-  "domain": "my_domain_a",
-  "prompt_taxonomy": {"domain_label": "annual reports"}
+  "primary_eval_id": "vidore_v3_finance_en:42:variant-1",
+  "domain": "vidore_v3_finance_en",
+  "prompt_taxonomy": {"domain_label": "English-language corporate finance filings"},
+  "original_query": "What was Acme Corp's free cash flow in FY2024?",
+  "sdg_prompt_candidates": {
+    "candidates": [
+      {
+        "variant_id": 1,
+        "prompt": "Look at the PDFs at ./pdfs/ and tell me Acme Corp's FY2024 free cash flow."
+      }
+    ]
+  },
+  "sdg_prompt_validation": {"selected_variant_id": 1},
+  "relevant_pages": [
+    {"doc_id": "Acme_10K_2024", "page_number_in_doc": 47, "score": 1}
+  ],
+  "answer": "$3.2B, per the FY2024 cash flow statement."
 }
 ```
 
-`doc_id` matches the source PDF filename without the `.pdf` extension;
-`page_number_in_doc` is 0-indexed.
+`doc_id` is the PDF basename without `.pdf`. `page_number_in_doc` is
+0-indexed.
 
-## What's in this repo
+## 3. Author Your Config
 
+Copy the packaged config and edit it:
+
+```bash
+cp src/skill_eval/configs/skill_eval.yaml ~/datasets/skill_eval.yaml
 ```
-src/nr_skill_eval/
-  cli.py        — typer entrypoint; resolves config + spawns sessions
-  runner.py     — per-trial workdir builder + claude subprocess driver
-  dataset.py    — manifest + config loaders
-  report.py     — per-(condition, domain) aggregation + summary writers
-  score.py      — recall@k
-  judge.py      — LLM-as-judge wrapper (litellm-backed)
-  artifacts.py  — timestamped session dirs + JSON writers
-  configs/      — packaged example config
-  prompts/      — setup + per-trial prompt templates (NL and slash variants)
+
+Example config:
+
+```yaml
+eval_manifest_path: ~/datasets/vidore_v3/agent_eval_manifest.json
+
+pdf_dirs:
+  vidore_v3_computer_science:  /datasets/vidore_v3/vidore_v3_computer_science
+  vidore_v3_energy:            /datasets/vidore_v3/vidore_v3_energy
+  vidore_v3_finance_en:        /datasets/vidore_v3/vidore_v3_finance_en
+  vidore_v3_finance_fr:        /datasets/vidore_v3/vidore_v3_finance_fr
+  vidore_v3_hr:                /datasets/vidore_v3/vidore_v3_hr
+  vidore_v3_industrial:        /datasets/vidore_v3/vidore_v3_industrial
+  vidore_v3_pharmaceuticals:   /datasets/vidore_v3/vidore_v3_pharmaceuticals
+  vidore_v3_physics:           /datasets/vidore_v3/vidore_v3_physics
+
+testdata_prefixes:
+  - test-data/vidore_v3/
+
+agent: claude
+agent_models:
+  claude: claude-opus-4-7
+  codex: gpt-5.5
+per_trial_budget_usd: 5.0
+per_trial_timeout_s: 600
+per_trial_workdir_root: /tmp/skill_eval
+
+judge:
+  enabled: true
+  model: nvidia_nim/mistralai/mixtral-8x22b-instruct-v0.1
+  api_base: https://integrate.api.nvidia.com/v1
+  api_key_env: NVIDIA_API_KEY
+
+summarizer:
+  enabled: true
+  model: claude-opus-4-7
+```
+
+Things to check:
+
+- `pdf_dirs` keys must exactly match the manifest's `domain` values.
+- Each `pdf_dirs` value must be a directory containing PDFs, not a glob.
+- `agent` must be `claude` or `codex`. You can override it per run with
+  `--agent`.
+- `agent_models` maps each agent to its default model. You can override it per
+  run with `--model`.
+- If paraphrased prompts contain source-tree paths, add those prefixes to
+  `testdata_prefixes` so prompt text resolves to `./pdfs/...` in the workdir.
+- The single-path key `pdf_dir` is still honored as a fallback for one-domain
+  configs.
+
+## 4. Run The Benchmark
+
+Smoke-test one domain first:
+
+```bash
+uv run skill-eval run \
+  --config ~/datasets/skill_eval.yaml \
+  --domains vidore_v3_finance_en
+```
+
+Run the same domain with Codex:
+
+```bash
+uv run skill-eval run \
+  --config ~/datasets/skill_eval.yaml \
+  --agent codex \
+  --domains vidore_v3_finance_en
+```
+
+Run all domains in the manifest:
+
+```bash
+uv run skill-eval run --config ~/datasets/skill_eval.yaml
+```
+
+Run with judge support installed:
+
+```bash
+uv run --extra llm skill-eval run --config ~/datasets/skill_eval.yaml
+```
+
+Domains execute sequentially. Each domain is one agent session, with one setup
+turn followed by one query turn per matching manifest entry.
+
+Example console shape:
+
+```text
+Loaded 412 dataset entries.
+Domains in this run: ['vidore_v3_finance_en'] (52 entries total)
+Session dir: /repo/artifacts/skilleval_20260519_170000_UTC
+Agent: claude  model=claude-opus-4-7  condition=c1_base
+Starting claude session for vidore_v3_finance_en - setup + 52 query turns (pdfs=/datasets/...)
+  turn 1 [claude/vidore_v3_finance_en] setup: status=ok tokens(in/out/cache_r)=... cost=$0.041 retrieved=0
+  turn 2 [claude/vidore_v3_finance_en] entry_id=1 query_id=vidore_v3_finance_en:1:variant-1: status=ok ... judge=4
+Recall for vidore_v3_finance_en: recall@1=0.115  recall@5=0.327  recall@10=0.481
+Cleaned up workdir for vidore_v3_finance_en
+```
+
+## CLI Reference
+
+```text
+skill-eval run [OPTIONS]
+```
+
+| Option | Default | Notes |
+|---|---|---|
+| `--config PATH` | packaged config | Strongly recommended; packaged config exits until dataset paths are filled in. |
+| `--eval-manifest PATH` | `cfg.eval_manifest_path` | Overrides the config manifest path for this invocation. |
+| `--domains LIST` | all domains in the manifest | Comma-separated subset. Unknown domains exit with code `2`. |
+| `--artifacts-root PATH` | `./artifacts/` | Where the timestamped session directory is created. |
+| `--agent claude|codex` | `cfg.agent` or `claude` | Selects the agent CLI to evaluate. |
+| `--model MODEL` | `cfg.agent_models.<agent>` | Overrides the selected agent's model for this invocation. |
+
+There is no condition selector. The CLI always runs the stock `c1_base` path.
+
+Configuration errors exit with code `2`, including missing selected agent CLI,
+missing manifest path, malformed `testdata_prefixes`, unknown domain, or
+missing PDF directory.
+
+## Output Layout
+
+Each run writes a timestamped session directory:
+
+```text
+<artifacts-root>/skilleval_<timestamp>/
+|-- config.yaml
+|-- session_summary.json
+|-- session_summary.md
+`-- trials/
+    `-- claude/
+        `-- c1_base/
+            `-- vidore_v3_finance_en/
+                |-- claude_c1_base_vidore_v3_finance_en_setup_t1.json
+                |-- claude_c1_base_vidore_v3_finance_en_e1_t2.json
+                `-- ...
+```
+
+Per-trial JSON files serialize the `TrialResult` dataclass: status, duration,
+token usage, cost, `final_answer`, `ranked_retrieved`, judge score, errors,
+domain, session id, and optional tool-use summary on the setup turn.
+
+Scratch workdirs under `per_trial_workdir_root` are deleted after each domain
+session finishes. Claude transcript JSONL lives under `~/.claude/projects/`;
+Codex transcript JSONL lives under `~/.codex/sessions/`. The harness reads the
+selected agent's transcript before cleanup for the optional tool-use summary.
+
+## Interpreting The Summary
+
+`session_summary.md` contains an overall row and one row per domain:
+
+- `success_rate`: fraction of turns that exited cleanly.
+- `recall@1`, `recall@5`, `recall@10`: macro-averaged recall over
+  `(doc_id, page_number)` pairs in `ranked_retrieved`.
+- `judge`: mean judge score with sample size, or `-` when judging is disabled
+  or unavailable.
+- `q_input`, `q_output`, `q_cache_read`, `q_cache_create`: mean per-query
+  agent session token usage when available.
+- `q_cost`: mean per-query turn USD cost. This is available for Claude runs
+  and rendered as unavailable for Codex runs.
+
+The setup table reports one-time setup-turn cost summed across domains. The
+session totals table reports setup plus all query turns. If summarization is
+enabled, a "Tool-use summaries" section describes the agent's tools and
+strategy per domain.
+
+## Troubleshooting
+
+**`Error: \`<agent>\` CLI is not on PATH`** - install or activate the selected
+agent CLI and confirm `which claude` or `which codex` resolves before running.
+
+**`config 'pdf_dirs' is missing an entry for domain '<X>'`** - add a matching
+key to `pdf_dirs`, or use `--domains` to skip that subset.
+
+**`PDF directory '...' for domain '...' does not exist or is not a directory`**
+- resolve the configured path manually and update the config.
+
+**Judge is disabled** - if `$NVIDIA_API_KEY` is unset, the run still succeeds
+and recall metrics are written; the judge column is empty. Install with
+`uv sync --extra llm` and export the configured API key env var to enable it.
+
+**Tool-use summary is skipped** - the selected agent's session JSONL was not
+found, or the summarizer call failed. Core trial results and metrics are
+unaffected.
+
+**Agent failed to write `./output.json`** - the trial JSON will show
+`status="extraction_failed"` and `extraction_method` as `missing` or
+`invalid_json`. Re-run the affected domain with `--domains <domain>` to capture
+a fresh trace.
+
+**Runs take too long** - use `--domains` to run a smaller subset. Domains are
+independent and artifact directories do not collide.
+
+## Repository Layout
+
+```text
+src/skill_eval/
+  cli.py              - Typer entrypoint; resolves config and spawns sessions
+  runner.py           - workdir builder and agent subprocess driver
+  dataset.py          - manifest and config loaders
+  report.py           - aggregation and summary writers
+  score.py            - recall@k
+  judge.py            - LLM-as-judge wrapper
+  trace_summarizer.py - Claude-CLI-backed tool-use narrator
+  artifacts.py        - timestamped session dirs and JSON writers
+  configs/            - packaged example config
+  prompts/            - setup and per-query prompt templates
 ```
 
 ## License
