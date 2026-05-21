@@ -464,6 +464,7 @@ def rescore_command(
     )
 
     rescored = 0
+    unscorable = 0
     still_failed = 0
     for path in candidates:
         raw, result = _load_trial(path)
@@ -487,6 +488,11 @@ def rescore_command(
             typer.echo(
                 f"  {path.name}: entry_id={result.entry_id} judge={result.judge_score}"
             )
+        elif result.judge_error in UNSCORABLE_JUDGE_ERRORS:
+            unscorable += 1
+            typer.echo(
+                f"  {path.name}: entry_id={result.entry_id} unscorable ({result.judge_error})"
+            )
         else:
             still_failed += 1
             typer.echo(
@@ -494,7 +500,9 @@ def rescore_command(
                 f"(error={result.judge_error or 'unknown'})"
             )
 
-    typer.echo(f"\nRescored {rescored}; still failed {still_failed}.")
+    typer.echo(
+        f"\nRescored {rescored}; unscorable {unscorable}; still failed {still_failed}."
+    )
 
     # Rebuild results_by_key from disk so the regenerated summary matches the
     # files we just wrote (including any trials we left untouched).
