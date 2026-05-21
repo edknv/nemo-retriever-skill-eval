@@ -35,6 +35,8 @@ directory.
 - [3. Author your config](#3-author-your-config)
 - [4. Run the benchmark](#4-run-the-benchmark)
 - [CLI reference](#cli-reference)
+  - [`skill-eval run`](#skill-eval-run)
+  - [`skill-eval rescore`](#skill-eval-rescore)
 - [Output layout](#output-layout)
 - [Interpreting the summary](#interpreting-the-summary)
 - [Troubleshooting](#troubleshooting)
@@ -268,6 +270,8 @@ Cleaned up workdir for vidore_v3_finance_en
 
 ## CLI Reference
 
+### `skill-eval run`
+
 ```text
 skill-eval run [OPTIONS]
 ```
@@ -286,6 +290,59 @@ There is no condition selector. The CLI always runs the stock `c1_base` path.
 Configuration errors exit with code `2`, including missing selected agent CLI,
 missing manifest path, malformed `testdata_prefixes`, unknown domain, or
 missing PDF directory.
+
+### `skill-eval rescore`
+
+```text
+skill-eval rescore SESSION_DIR [OPTIONS]
+```
+
+Re-judges trials in a previous run's artifact directory and rewrites their
+per-trial JSON files in place. Use this when the judge model was unreachable
+during the original run (401, rate-limit, timeout), when you switched to a
+new judge model and want apples-to-apples scores across an older session, or
+when the previous judge produced an empty score for any other reason.
+
+`rescore` only touches query-turn trials. Setup turns are never judged.
+By default it rescores trials whose `judge_score` is `null` (or `0`) **or**
+whose `judge_error` is non-empty; everything else is left alone. Pass
+`--force` to rescore every query trial regardless.
+
+| Option | Default | Notes |
+|---|---|---|
+| `SESSION_DIR` (positional) | — | Artifact session directory from a previous `skill-eval run` (e.g. `artifacts/skilleval_20260521_224824_UTC`). |
+| `--config PATH` | `SESSION_DIR/config.yaml` | Config used to build the judge and resolve the manifest. Pass a different config to rescore with a new judge model. |
+| `--eval-manifest PATH` | `cfg.eval_manifest_path` | Manifest to look up each trial's reference answer by `entry_id`. Override only if the original config's manifest path is no longer valid. |
+| `--force` | off | Rescore every query-turn trial, not just the ones missing/erroring. |
+
+After rescoring, `session_summary.json` and `session_summary.md` are
+regenerated from the (now-updated) on-disk trial files so the aggregated
+judge mean and sample count reflect the new scores.
+
+Examples:
+
+```bash
+# Rescore failed trials using the same judge config the run was created with
+uv run --extra llm skill-eval rescore artifacts/skilleval_20260521_224824_UTC
+
+# Swap in a different judge model for the rescoring pass
+uv run --extra llm skill-eval rescore artifacts/skilleval_20260521_224824_UTC \
+    --config ~/alt-judge-config.yaml
+
+# Force a full re-judge of every query turn (e.g. after upgrading the judge)
+uv run --extra llm skill-eval rescore artifacts/skilleval_20260521_224824_UTC --force
+```
+
+Caveats:
+
+- `rescore` mutates per-trial JSON in place. Snapshot the session directory
+  first if you want to compare old vs new scores.
+- The `entry_id`s on disk must still resolve in the manifest. If you
+  reordered or trimmed the manifest after the run, pass `--eval-manifest`
+  pointing at the original.
+- The judge build uses the same path as `run`: missing `[llm]` extra or
+  missing `NVIDIA_API_KEY` (or whichever `judge.api_key_env` you set) exits
+  with code `2` rather than silently no-oping.
 
 ## Output Layout
 
@@ -353,7 +410,15 @@ and recall metrics are written; the judge column is empty. Install with
 keys (`sk-***`). If your key starts with `nvapi-***`, it's a build.nvidia.com
 key and belongs against `https://integrate.api.nvidia.com/v1` instead.
 Match key prefix to `api_base`, or swap the `api_base` to the endpoint your
-key was issued for.
+key was issued for. Once your key is working, you can fix already-completed
+sessions in place with [`skill-eval rescore`](#skill-eval-rescore) instead of
+re-running the agents.
+
+**Judge scores are empty or zero on a finished session** - the judge call
+failed during the original run (401, timeout, rate-limit, parse failure).
+Fix the underlying issue, then run
+`skill-eval rescore <session-dir>` to re-judge just the failed query turns
+and regenerate the session summary.
 
 **Tool-use summary is skipped** - the selected agent's session JSONL was not
 found, or the summarizer call failed. Core trial results and metrics are

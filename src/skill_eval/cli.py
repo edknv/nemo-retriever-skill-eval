@@ -6,10 +6,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
 from collections import defaultdict
+from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Any, Optional
 
@@ -23,6 +25,8 @@ from skill_eval.runner import (
     BASE_CONDITION,
     DEFAULT_AGENT_MODELS,
     SUPPORTED_AGENTS,
+    TrialResult,
+    _apply_judge,
     cleanup_session_workdir,
     extract_compact_trace,
     run_session,
@@ -332,5 +336,177 @@ def run_command(
         config_path=str(config) if config else "<packaged default>",
     )
     typer.echo(f"\nWrote {json_path}")
+    typer.echo(f"Wrote {md_path}")
+    typer.echo("\nDone.")
+
+
+def _needs_rescore(trial: dict[str, Any]) -> bool:
+    """A query-turn trial needs rescoring if its score is missing/zero or it errored.
+
+    Setup turns are never judged. ``judge_score`` is normally an int in 1-5 or
+    ``None``; we treat ``0`` the same as ``None`` since the user reported a
+    failed judge surfacing as a zero score.
+    """
+    if trial.get("is_setup"):
+        return False
+    score = trial.get("judge_score")
+    if score is None or score == 0:
+        return True
+    if trial.get("judge_error"):
+        return True
+    return False
+
+
+def _load_trial(path: Path) -> tuple[dict[str, Any], TrialResult]:
+    """Load a trial JSON and reconstruct a ``TrialResult``.
+
+    Returns the raw dict alongside the dataclass so callers can write back
+    fields the dataclass doesn't carry (none today, but future-proof against
+    on-disk schema drift).
+    """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    known = {f.name for f in fields(TrialResult)}
+    ctor_kwargs = {k: v for k, v in data.items() if k in known}
+    return data, TrialResult(**ctor_kwargs)
+
+
+def _iter_trial_files(session_dir: Path) -> list[Path]:
+    return sorted((session_dir / "trials").rglob("*.json"))
+
+
+@app.command("rescore")
+def rescore_command(
+    session_dir: Path = typer.Argument(
+        ...,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        help="Artifact session directory from a previous `skill-eval run` (e.g. artifacts/skilleval_*).",
+    ),
+    config: Optional[Path] = typer.Option(
+        None,
+        "--config",
+        help="Judge/manifest config to use. Defaults to the session's own config.yaml.",
+    ),
+    eval_manifest: Optional[Path] = typer.Option(
+        None,
+        "--eval-manifest",
+        help="Manifest path. Overrides eval_manifest_path from --config / session config.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Rescore every query-turn trial, not just the empty/failed ones.",
+    ),
+) -> None:
+    """Re-judge query-turn trials with missing or failed judge scores.
+
+    Walks ``session_dir/trials/**/*.json`` and rewrites each matching trial
+    in place with a fresh ``judge_score`` / ``judge_reasoning`` /
+    ``judge_error``. After rescoring, ``session_summary.json`` and
+    ``session_summary.md`` are regenerated so aggregated judge metrics reflect
+    the new scores.
+    """
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    session_dir = session_dir.resolve()
+    trials_dir = session_dir / "trials"
+    if not trials_dir.is_dir():
+        typer.echo(f"Error: {trials_dir} does not exist — is this a skill_eval session dir?", err=True)
+        raise typer.Exit(code=2)
+
+    session_cfg_path = session_dir / "config.yaml"
+    if config is not None:
+        cfg = load_config(config)
+        config_path_str = str(config)
+    elif session_cfg_path.is_file():
+        cfg = load_config(session_cfg_path)
+        config_path_str = str(session_cfg_path)
+    else:
+        typer.echo(
+            f"Error: no --config given and {session_cfg_path} is missing; cannot resolve judge settings.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    manifest_path = eval_manifest or cfg.get("eval_manifest_path")
+    if not manifest_path:
+        typer.echo("Error: config is missing 'eval_manifest_path' and --eval-manifest was not provided.", err=True)
+        raise typer.Exit(code=2)
+    entries = load_eval_manifest(Path(str(manifest_path)).expanduser().resolve())
+    entries_by_id = {e.entry_id: e for e in entries}
+
+    judge = _build_judge(cfg)
+    if judge is None:
+        typer.echo("Error: judge is not configured (see messages above). Cannot rescore.", err=True)
+        raise typer.Exit(code=2)
+
+    trial_files = _iter_trial_files(session_dir)
+    candidates = []
+    for path in trial_files:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("is_setup"):
+            continue
+        if force or _needs_rescore(data):
+            candidates.append(path)
+
+    typer.echo(
+        f"Rescoring {len(candidates)} trial(s) out of {len(trial_files)} on disk "
+        f"(force={'on' if force else 'off'})."
+    )
+
+    rescored = 0
+    still_failed = 0
+    for path in candidates:
+        raw, result = _load_trial(path)
+        entry = entries_by_id.get(result.entry_id)
+        if entry is None:
+            typer.echo(f"  {path.name}: skip (entry_id={result.entry_id} not in manifest)")
+            continue
+
+        # Clear stale judge state so _apply_judge starts from a clean slate.
+        result.judge_score = None
+        result.judge_reasoning = ""
+        result.judge_error = ""
+
+        _apply_judge(judge, entry, result)
+
+        raw.update(asdict(result))
+        path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+
+        if result.judge_score is not None:
+            rescored += 1
+            typer.echo(
+                f"  {path.name}: entry_id={result.entry_id} judge={result.judge_score}"
+            )
+        else:
+            still_failed += 1
+            typer.echo(
+                f"  {path.name}: entry_id={result.entry_id} still failed "
+                f"(error={result.judge_error or 'unknown'})"
+            )
+
+    typer.echo(f"\nRescored {rescored}; still failed {still_failed}.")
+
+    # Rebuild results_by_key from disk so the regenerated summary matches the
+    # files we just wrote (including any trials we left untouched).
+    results_by_key: dict[tuple[str, str, str], list[TrialResult]] = defaultdict(list)
+    for path in trial_files:
+        _, result = _load_trial(path)
+        results_by_key[(result.agent, result.condition, result.domain)].append(result)
+
+    agent = str(cfg.get("agent") or "claude")
+    model = str(cfg.get("agent_model") or _resolve_agent_model(cfg, agent, None))
+
+    json_path, md_path = write_summary(
+        session_dir=session_dir,
+        results_by_key=dict(results_by_key),
+        entries=entries,
+        config=cfg,
+        agent=agent,
+        model=model,
+        config_path=config_path_str,
+    )
+    typer.echo(f"Wrote {json_path}")
     typer.echo(f"Wrote {md_path}")
     typer.echo("\nDone.")
