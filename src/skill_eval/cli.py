@@ -28,6 +28,7 @@ from skill_eval.runner import (
     UNSCORABLE_JUDGE_ERRORS,
     TrialResult,
     _apply_judge,
+    archive_session_log,
     cleanup_session_workdir,
     extract_compact_trace,
     run_session,
@@ -305,6 +306,20 @@ def run_command(
             f"recall@5={scores['recall_5']:.3f}  "
             f"recall@10={scores['recall_10']:.3f}"
         )
+
+        if results:
+            archived = archive_session_log(
+                session_dir=session_dir,
+                agent=agent,
+                condition=BASE_CONDITION,
+                domain=domain,
+                session_uuid=results[0].session_id,
+                workdir=workdir,
+            )
+            if archived is not None:
+                typer.echo(f"  archived session log: {archived.relative_to(session_dir)}")
+            else:
+                typer.echo(f"  session log not found for archiving ({agent}/{domain})")
 
         cleanup_session_workdir(workdir)
         typer.echo(f"Cleaned up workdir for {domain}\n")

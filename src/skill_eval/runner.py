@@ -133,6 +133,39 @@ def cleanup_session_workdir(workdir: Path) -> None:
     logger.info("cleaned up workdir %s", workdir)
 
 
+def archive_session_log(
+    *,
+    session_dir: Path,
+    agent: str,
+    condition: str,
+    domain: str,
+    session_uuid: str,
+    workdir: Path,
+) -> Path | None:
+    """Copy the agent's rollout log into the artifact dir so it survives ``cleanup_session_workdir``.
+
+    Without this, the per-trial JSONs are the only persistent record of the run —
+    you cannot retroactively recompute token deltas, tool-use signals, or anything
+    else that requires the raw event stream.
+    """
+    if agent == "claude":
+        src: Path | None = _claude_session_log_path(workdir, session_uuid)
+    elif agent == "codex":
+        src = _codex_session_log_path(session_uuid)
+    else:
+        return None
+    if src is None or not src.exists():
+        return None
+    parts = [session_dir, "trials", agent, condition]
+    if domain:
+        parts.append(domain)
+    logs_dir = Path(*[str(p) for p in parts]) / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    dest = logs_dir / src.name
+    shutil.copy2(src, dest)
+    return dest
+
+
 def _build_claude_command(
     model: str,
     budget_usd: float,
@@ -287,7 +320,20 @@ def _populate_claude_tokens(result: TrialResult, envelope: dict[str, Any]) -> No
     result.ephemeral_1h_input_tokens = int(cache_detail.get("ephemeral_1h_input_tokens") or 0)
 
 
-def _populate_codex_tokens(result: TrialResult, events: list[dict[str, Any]]) -> None:
+_CODEX_USAGE_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cached_input_tokens",
+    "reasoning_output_tokens",
+)
+
+
+def _extract_codex_total_usage(events: list[dict[str, Any]]) -> dict[str, int]:
+    """Return the most recent cumulative ``total_token_usage`` from codex events.
+
+    Each ``token_count`` event carries running session-wide counters; we want the
+    last one so deltas between two snapshots equal one turn's true work.
+    """
     for ev in reversed(events):
         if ev.get("type") != "event_msg":
             continue
@@ -297,14 +343,33 @@ def _populate_codex_tokens(result: TrialResult, events: list[dict[str, Any]]) ->
         info = payload.get("info") or {}
         if not isinstance(info, dict):
             continue
-        usage = info.get("last_token_usage") or info.get("total_token_usage") or {}
+        usage = info.get("total_token_usage") or {}
         if not isinstance(usage, dict):
             continue
-        result.input_tokens = int(usage.get("input_tokens") or 0)
-        result.output_tokens = int(usage.get("output_tokens") or 0)
-        result.cache_read_input_tokens = int(usage.get("cached_input_tokens") or 0)
-        result.cache_creation_input_tokens = int(usage.get("cache_creation_input_tokens") or 0)
-        return
+        return {k: int(usage.get(k) or 0) for k in _CODEX_USAGE_FIELDS}
+    return {k: 0 for k in _CODEX_USAGE_FIELDS}
+
+
+def _populate_codex_tokens(
+    result: TrialResult,
+    current_totals: dict[str, int],
+    prior_totals: dict[str, int],
+) -> None:
+    """Set per-turn token fields as the delta of cumulative ``total_token_usage``.
+
+    Codex's resumed-session log is append-only across all turns, and each
+    ``token_count`` event reports cumulative counters, so per-turn cost is the
+    difference between snapshots taken before and after the subprocess call.
+    ``output_tokens`` here folds in ``reasoning_output_tokens`` so the column
+    reflects everything the model emitted, matching Claude's accounting.
+    """
+    def d(key: str) -> int:
+        return max(0, current_totals.get(key, 0) - prior_totals.get(key, 0))
+
+    result.input_tokens = d("input_tokens")
+    result.output_tokens = d("output_tokens") + d("reasoning_output_tokens")
+    result.cache_read_input_tokens = d("cached_input_tokens")
+    result.cache_creation_input_tokens = 0
 
 
 def _parse_output_json(workdir: Path) -> tuple[str, list[dict[str, Any]], str, list[str]]:
@@ -636,6 +701,13 @@ def _run_one_turn(
     domain_tag = f"[{domain}] " if domain else ""
     label = "setup" if is_setup else f"entry_id={entry_id}, query_id={query_id}"
     logger.info("turn %d %s(%s)", turn_idx + 1, domain_tag, label)
+
+    prior_codex_usage: dict[str, int] = {k: 0 for k in _CODEX_USAGE_FIELDS}
+    if agent == "codex":
+        prior_log = _codex_session_log_path(session_uuid)
+        if prior_log is not None:
+            prior_codex_usage = _extract_codex_total_usage(_read_jsonl_events(prior_log))
+
     t0 = time.monotonic()
     try:
         proc = subprocess.run(
@@ -719,7 +791,8 @@ def _run_one_turn(
     if agent == "claude":
         _populate_claude_tokens(result, envelope)
     else:
-        _populate_codex_tokens(result, token_events or codex_events)
+        current_codex_usage = _extract_codex_total_usage(token_events or codex_events)
+        _populate_codex_tokens(result, current_codex_usage, prior_codex_usage)
     if proc.returncode != 0:
         result.errors.append(f"non-zero exit {proc.returncode}")
     if agent == "claude" and envelope.get("is_error"):
