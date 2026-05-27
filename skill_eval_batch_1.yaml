@@ -17,6 +17,11 @@ testdata_prefixes:
   - test-data/vidorev3-finance/pdfs
   - test-data/vidorev3-hr/pdfs
 
+# Rename ./pdfs/ symlinks to opaque doc_<sha1[:10]>.pdf so the agent
+# cannot grep query terms out of filenames. Real doc_ids still appear
+# in trial JSON; a per-domain doc_id_mapping.json is written for debugging.
+anonymize_filenames: true
+
 # Agent selection, model, and per-trial limits
 agent: claude
 agent_models:
