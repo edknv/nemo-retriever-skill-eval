@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -69,6 +70,55 @@ class TrialResult:
     cost_available: bool = True
 
 
+_DOC_ID_HASH_LEN = 10
+
+
+def _hash_stem(stem: str) -> str:
+    return "doc_" + hashlib.sha1(stem.encode("utf-8")).hexdigest()[:_DOC_ID_HASH_LEN]
+
+
+@dataclass(frozen=True)
+class DocIdMap:
+    """Bidirectional map between real PDF basenames (without ``.pdf``) and
+    opaque ``doc_<sha1[:10]>`` ids used as anonymized filenames inside the
+    agent's workdir.
+
+    The same real stem always produces the same anonymized id (stable across
+    runs), so debugging output is reproducible. Collisions in the 10-hex-char
+    prefix raise immediately rather than silently overwriting a symlink.
+    """
+
+    real_to_anon: dict[str, str]
+    anon_to_real: dict[str, str]
+
+    @classmethod
+    def from_stems(cls, stems: list[str]) -> "DocIdMap":
+        real_to_anon: dict[str, str] = {}
+        anon_to_real: dict[str, str] = {}
+        for stem in stems:
+            anon = _hash_stem(stem)
+            existing = anon_to_real.get(anon)
+            if existing is not None and existing != stem:
+                raise ValueError(
+                    f"doc_id hash collision: {existing!r} and {stem!r} both map to {anon!r}; "
+                    f"widen _DOC_ID_HASH_LEN or rename one of the source files"
+                )
+            real_to_anon[stem] = anon
+            anon_to_real[anon] = stem
+        return cls(real_to_anon=real_to_anon, anon_to_real=anon_to_real)
+
+    @classmethod
+    def from_pdf_dir(cls, pdf_source: Path) -> "DocIdMap":
+        stems = sorted(p.stem for p in pdf_source.glob("*.pdf"))
+        return cls.from_stems(stems)
+
+    def anonymize(self, real_stem: str) -> str:
+        return self.real_to_anon.get(real_stem, real_stem)
+
+    def deanonymize(self, anon_stem: str) -> str:
+        return self.anon_to_real.get(anon_stem, anon_stem)
+
+
 def _remap_pdf_paths(text: str, prefixes: tuple[str, ...]) -> str:
     """Rewrite caller-supplied path prefixes in *text* to ``./pdfs/``.
 
@@ -93,20 +143,34 @@ def _render_setup_prompt(domain_label: str = "PDFs") -> str:
     return text.replace("{{ domain_label }}", domain_label)
 
 
-def _build_pdf_symlinks(pdf_source: Path, dest: Path) -> None:
+def _build_pdf_symlinks(
+    pdf_source: Path, dest: Path, doc_map: "DocIdMap | None" = None
+) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     for pdf in sorted(pdf_source.glob("*.pdf")):
-        target = dest / pdf.name
+        if doc_map is not None:
+            anon = doc_map.anonymize(pdf.stem)
+            target_name = f"{anon}.pdf"
+        else:
+            target_name = pdf.name
+        target = dest / target_name
         if target.is_symlink() or target.exists():
             continue
         target.symlink_to(pdf.resolve())
 
 
-def _build_session_workdir(agent: str, root: Path, pdf_source: Path, domain: str = "") -> Path:
+def _build_session_workdir(
+    agent: str,
+    root: Path,
+    pdf_source: Path,
+    domain: str = "",
+    doc_map: "DocIdMap | None" = None,
+) -> Path:
     """Build the per-session workdir.
 
     Workdir contents:
-      - pdfs/ symlink farm into the source PDF folder
+      - pdfs/ symlink farm into the source PDF folder (renamed via ``doc_map``
+        when supplied so the agent only sees opaque filenames)
       - .claude/ sandbox with an empty settings.json for Claude runs
 
     The agent itself creates any retrieval artifacts (e.g. ./lancedb/) inside
@@ -115,7 +179,7 @@ def _build_session_workdir(agent: str, root: Path, pdf_source: Path, domain: str
     domain_seg = f"_{domain}" if domain else ""
     workdir = root / f"{agent}_{BASE_CONDITION}{domain_seg}_{uuid.uuid4().hex[:8]}"
     workdir.mkdir(parents=True, exist_ok=True)
-    _build_pdf_symlinks(pdf_source, workdir / "pdfs")
+    _build_pdf_symlinks(pdf_source, workdir / "pdfs", doc_map)
     if agent == "claude":
         (workdir / ".claude").mkdir(parents=True, exist_ok=True)
         (workdir / ".claude" / "settings.json").write_text("{}\n", encoding="utf-8")
@@ -400,6 +464,34 @@ def _parse_output_json(workdir: Path) -> tuple[str, list[dict[str, Any]], str, l
             continue
         cleaned.append({"doc_id": str(doc_id), "page_number": int(page), "rank": int(item.get("rank") or i)})
     return str(payload.get("final_answer") or ""), cleaned, ("ok" if not errors else "schema_warning"), errors
+
+
+def _apply_doc_map_to_ranked(
+    ranked: list[dict[str, Any]],
+    doc_map: "DocIdMap | None",
+) -> list[dict[str, Any]]:
+    """Rewrite each ranked entry's ``doc_id`` from anonymized -> real and
+    attach the anonymized value on a sidecar ``anonymized_doc_id`` field.
+
+    No-op when ``doc_map`` is ``None``: returns ``ranked`` unchanged so the
+    on-disk schema is byte-identical to the pre-feature shape.
+
+    An anonymized id the map doesn't recognize (agent hallucination, or it
+    tried to outsmart the renaming) passes through unchanged in ``doc_id``;
+    ``anonymized_doc_id`` is set to the same value. Recall scoring then
+    naturally returns 0 for that entry.
+    """
+    if doc_map is None:
+        return ranked
+    out: list[dict[str, Any]] = []
+    for entry in ranked:
+        anon = str(entry.get("doc_id") or "")
+        real = doc_map.deanonymize(anon)
+        new_entry = dict(entry)
+        new_entry["doc_id"] = real
+        new_entry["anonymized_doc_id"] = anon
+        out.append(new_entry)
+    return out
 
 
 def _extract_model_id(envelope: dict[str, Any], fallback: str) -> str:
@@ -691,6 +783,7 @@ def _run_one_turn(
     env: dict[str, str],
     timeout_s: int,
     model: str,
+    doc_map: "DocIdMap | None" = None,
 ) -> TrialResult:
     """Execute one turn. Query turns (is_setup=False) expect the agent to write
     ./output.json; the setup turn does not."""
@@ -807,6 +900,7 @@ def _run_one_turn(
 
     if not is_setup:
         answer, ranked, extract_status, extract_errors = _parse_output_json(workdir)
+        ranked = _apply_doc_map_to_ranked(ranked, doc_map)
         if extract_status in ("missing", "invalid_json"):
             result.extraction_method = extract_status
             if result.status == "ok":
@@ -871,6 +965,7 @@ def run_session(
     domain_label: str = "PDFs",
     judge: Any = None,
     testdata_prefixes: tuple[str, ...] = (),
+    doc_map: "DocIdMap | None" = None,
 ) -> tuple[Path, list[TrialResult]]:
     """Run one agent session covering setup + all `entries`.
 
@@ -881,7 +976,7 @@ def run_session(
     """
     if agent not in SUPPORTED_AGENTS:
         raise ValueError(f"unsupported agent: {agent}")
-    workdir = _build_session_workdir(agent, workdir_root, pdf_source, domain=domain)
+    workdir = _build_session_workdir(agent, workdir_root, pdf_source, domain=domain, doc_map=doc_map)
     session_uuid = str(uuid.uuid4())
     env = os.environ.copy()
     logger.info(
@@ -918,6 +1013,7 @@ def run_session(
         env=env,
         timeout_s=timeout_s,
         model=model,
+        doc_map=doc_map,
     )
     results.append(setup_result)
 
@@ -956,6 +1052,7 @@ def run_session(
             env=env,
             timeout_s=timeout_s,
             model=model,
+            doc_map=doc_map,
         )
         _apply_judge(judge, entry, result)
         results.append(result)

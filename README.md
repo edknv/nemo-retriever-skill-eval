@@ -186,6 +186,8 @@ pdf_dirs:
 testdata_prefixes:
   - test-data/vidore_v3/
 
+anonymize_filenames: false
+
 agent: claude
 agent_models:
   claude: claude-opus-4-7
@@ -284,6 +286,7 @@ skill-eval run [OPTIONS]
 | `--artifacts-root PATH` | `./artifacts/` | Where the timestamped session directory is created. |
 | `--agent claude|codex` | `cfg.agent` or `claude` | Selects the agent CLI to evaluate. |
 | `--model MODEL` | `cfg.agent_models.<agent>` | Overrides the selected agent's model for this invocation. |
+| `--anonymize-filenames / --no-anonymize-filenames` | `cfg.anonymize_filenames` or `false` | Rename `./pdfs/` symlinks to opaque `doc_<sha1[:10]>.pdf` so the agent can't grep query terms from filenames. Real `doc_id`s still appear in trial JSON. |
 
 There is no condition selector. The CLI always runs the stock `c1_base` path.
 
@@ -359,6 +362,7 @@ Each run writes a timestamped session directory:
             `-- vidore_v3_finance_en/
                 |-- claude_c1_base_vidore_v3_finance_en_setup_t1.json
                 |-- claude_c1_base_vidore_v3_finance_en_e1_t2.json
+                |-- doc_id_mapping.json   # only when --anonymize-filenames
                 `-- ...
 ```
 

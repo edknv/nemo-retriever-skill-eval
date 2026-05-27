@@ -33,6 +33,9 @@ dependencies = [
 llm = [
   "litellm>=1.50.0",
 ]
+dev = [
+  "pytest>=8.0",
+]
 
 [project.scripts]
 skill-eval = "skill_eval.cli:app"
@@ -45,3 +48,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 skill_eval = ["configs/*.yaml", "prompts/*.j2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

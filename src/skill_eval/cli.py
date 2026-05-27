@@ -24,6 +24,7 @@ from skill_eval.report import overall_recall, write_summary
 from skill_eval.runner import (
     BASE_CONDITION,
     DEFAULT_AGENT_MODELS,
+    DocIdMap,
     SUPPORTED_AGENTS,
     UNSCORABLE_JUDGE_ERRORS,
     TrialResult,
@@ -183,6 +184,12 @@ def run_command(
         "--model",
         help="Agent model override for this run.",
     ),
+    anonymize_filenames: Optional[bool] = typer.Option(
+        None,
+        "--anonymize-filenames/--no-anonymize-filenames",
+        help="Rename ./pdfs/ symlinks to opaque doc_<sha1[:10]>.pdf so the agent "
+             "cannot grep query terms from filenames. Overrides config.anonymize_filenames.",
+    ),
 ) -> None:
     """Run the benchmark across the dataset's domains, sequentially."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -228,6 +235,11 @@ def run_command(
         typer.echo("Error: config 'testdata_prefixes' must be a list of strings.", err=True)
         raise typer.Exit(code=2)
     testdata_prefixes = tuple(str(p) for p in testdata_prefixes_raw)
+    anonymize = (
+        anonymize_filenames
+        if anonymize_filenames is not None
+        else bool(cfg.get("anonymize_filenames", False))
+    )
 
     judge = _build_judge(cfg)
     summarizer = _build_trace_summarizer(cfg)
@@ -236,10 +248,12 @@ def run_command(
     session_dir = create_session_dir("skilleval", base_dir=base_dir)
     typer.echo(f"Session dir: {session_dir}")
     typer.echo(f"Agent: {agent}  model={model}  condition={BASE_CONDITION}")
+    typer.echo(f"Anonymize filenames: {'on' if anonymize else 'off'}")
 
     resolved_cfg = dict(cfg)
     resolved_cfg["agent"] = agent
     resolved_cfg["agent_model"] = model
+    resolved_cfg["anonymize_filenames"] = anonymize
     (session_dir / "config.yaml").write_text(yaml.safe_dump(resolved_cfg, default_flow_style=False), encoding="utf-8")
 
     # Results keyed (agent, condition, domain) so reports can compare agent runs.
@@ -259,6 +273,7 @@ def run_command(
             f"Starting {agent} session for {domain} — setup + {len(domain_entries)} query turns "
             f"(pdfs={pdf_source})"
         )
+        doc_map = DocIdMap.from_pdf_dir(pdf_source) if anonymize else None
         workdir, results = run_session(
             agent=agent,
             entries=domain_entries,
@@ -271,6 +286,7 @@ def run_command(
             domain_label=domain_label,
             judge=judge,
             testdata_prefixes=testdata_prefixes,
+            doc_map=doc_map,
         )
         if summarizer is not None and results:
             trace = extract_compact_trace(agent, workdir, results[0].session_id)
@@ -297,6 +313,14 @@ def run_command(
                 f"cost={cost_str} retrieved={len(r.ranked_retrieved)}{judge_str}"
             )
         results_by_key[(agent, BASE_CONDITION, domain)] = results
+
+        if doc_map is not None:
+            mapping_dir = session_dir / "trials" / agent / BASE_CONDITION / domain
+            mapping_dir.mkdir(parents=True, exist_ok=True)
+            (mapping_dir / "doc_id_mapping.json").write_text(
+                json.dumps({"real_to_anon": doc_map.real_to_anon}, indent=2) + "\n",
+                encoding="utf-8",
+            )
 
         entries_by_id = {e.entry_id: e for e in domain_entries}
         scores = overall_recall(results, entries_by_id)

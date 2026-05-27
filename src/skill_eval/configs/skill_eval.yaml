@@ -52,6 +52,17 @@ pdf_dirs: {}
 testdata_prefixes: []
 
 # ---------------------------------------------------------------------------
+# OPTIONAL — anonymize PDF filenames in the agent's workdir
+# ---------------------------------------------------------------------------
+# When true, the per-domain ``./pdfs/`` symlinks are renamed to opaque
+# ``doc_<sha1[:10]>.pdf`` so the agent cannot grep query terms out of the
+# basenames. Real ``doc_id`` values still appear in ``trials/.../*.json``,
+# so scoring, ``rescore``, and external tooling are unaffected. A
+# per-domain ``doc_id_mapping.json`` is written under the trial dir for
+# debugging.
+anonymize_filenames: false
+
+# ---------------------------------------------------------------------------
 # Agent selection, model, and per-trial limits
 # ---------------------------------------------------------------------------
 agent: claude
