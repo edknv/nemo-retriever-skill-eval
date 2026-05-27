@@ -90,6 +90,20 @@ judge:
   max_tokens: 32768
   # Low/zero temperature keeps scoring reproducible across runs.
   temperature: 0.0
+  # On-disk path to the simple QA judge prompt (batch_1's llm_scorer_prompt.md).
+  # When null, the runner looks for ``llm_scorer_prompt.md`` next to the
+  # manifest. Required only for entries WITHOUT a ``scoring_mode`` field.
+  simple_prompt_path: null
+  # On-disk path to the scenario-aware judge prompt (batch_2's
+  # llm_scenario_scorer_prompt.md). When null, the runner looks for
+  # ``llm_scenario_scorer_prompt.md`` next to the manifest. Required only for
+  # entries WITH a ``scoring_mode`` field.
+  scenario_prompt_path: null
+  # When true (default), ALSO run the legacy hardcoded ``LLMJudge`` on every
+  # scoreable trial. Produces an additional 1-5 score directly comparable to
+  # runs that pre-date the scenario-aware judge. Set to false to halve judge
+  # LLM cost when cross-comparability isn't needed.
+  legacy_enabled: true
 
 # ---------------------------------------------------------------------------
 # Tool-use summarizer

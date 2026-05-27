@@ -61,12 +61,17 @@ def _resolve_pdf_source(
     raise typer.BadParameter("config must define either 'pdf_dirs' (per-domain map) or 'pdf_dir'.")
 
 
-def _build_judge(cfg: dict) -> Optional[Any]:
-    """Construct an ``LLMJudge`` from ``cfg['judge']`` or return ``None``.
+def _build_judge(cfg: dict, *, manifest_path: Optional[Path] = None) -> Optional[Any]:
+    """Construct a ``JudgeContext`` from ``cfg['judge']`` or return ``None``.
 
-    Skips silently (with a console note) when the API key env var is unset, so
-    runs work end-to-end without network access. Import is deferred so the
-    ``litellm`` extra isn't required when judging is disabled.
+    Skips silently (with a console note) when the API key env var is unset,
+    so runs work end-to-end without network access. The two judge-prompt
+    paths default to the manifest's parent directory if not overridden in
+    the config; only the path for the mode a given entry uses must actually
+    exist on disk. When ``judge.legacy_enabled`` is true (the default), the
+    hardcoded-prompt ``LLMJudge`` is also constructed and run in parallel
+    so scores remain comparable to runs that pre-date the scenario-aware
+    judge.
     """
     judge_cfg = cfg.get("judge") or {}
     if not judge_cfg.get("enabled", True):
@@ -77,23 +82,67 @@ def _build_judge(cfg: dict) -> Optional[Any]:
     if not api_key:
         typer.echo(f"Judge disabled: ${api_key_env} is not set in the environment.")
         return None
+
     try:
-        from skill_eval.judge import LLMJudge
+        from skill_eval.judging import LiteLLMChatClient
     except ImportError as exc:
-        typer.echo(f"Judge disabled: failed to import LLMJudge ({exc}). Install skill-eval[llm].")
+        typer.echo(f"Judge disabled: failed to import LiteLLMChatClient ({exc}). Install skill-eval[llm].")
         return None
-    judge_kwargs: dict[str, Any] = dict(
-        model=str(judge_cfg.get("model", "openai/nvidia/nvidia/llama-3.3-nemotron-super-49b-v1.5")),
-        api_base=judge_cfg.get("api_base"),
-        api_key=api_key,
-    )
-    if "max_tokens" in judge_cfg:
-        judge_kwargs["max_tokens"] = int(judge_cfg["max_tokens"])
+    from skill_eval.runner import JudgeContext
+
+    model = str(judge_cfg.get("model", "openai/nvidia/nvidia/llama-3.3-nemotron-super-49b-v1.5"))
+    api_base = judge_cfg.get("api_base")
+    client_kwargs: dict[str, Any] = dict(model=model, api_base=api_base, api_key=api_key)
     if "temperature" in judge_cfg:
-        judge_kwargs["temperature"] = float(judge_cfg["temperature"])
-    judge = LLMJudge.from_kwargs(**judge_kwargs)
-    typer.echo(f"Judge enabled: model={judge.model}")
-    return judge
+        client_kwargs["temperature"] = float(judge_cfg["temperature"])
+    if "max_tokens" in judge_cfg:
+        client_kwargs["max_tokens"] = int(judge_cfg["max_tokens"])
+    client = LiteLLMChatClient.from_kwargs(**client_kwargs)
+
+    legacy_judge = None
+    if judge_cfg.get("legacy_enabled", True):
+        try:
+            from skill_eval.judge import LLMJudge
+        except ImportError as exc:
+            typer.echo(f"Legacy judge disabled: failed to import LLMJudge ({exc}).")
+        else:
+            legacy_kwargs: dict[str, Any] = dict(model=model, api_base=api_base, api_key=api_key)
+            if "temperature" in judge_cfg:
+                legacy_kwargs["temperature"] = float(judge_cfg["temperature"])
+            if "max_tokens" in judge_cfg:
+                legacy_kwargs["max_tokens"] = int(judge_cfg["max_tokens"])
+            legacy_judge = LLMJudge.from_kwargs(**legacy_kwargs)
+
+    simple_path = judge_cfg.get("simple_prompt_path")
+    scenario_path = judge_cfg.get("scenario_prompt_path")
+    manifest_dir: Optional[Path] = None
+    if manifest_path is not None:
+        manifest_dir = Path(manifest_path).expanduser().resolve().parent
+    simple_resolved = (
+        Path(str(simple_path)).expanduser().resolve()
+        if simple_path
+        else (manifest_dir / "llm_scorer_prompt.md" if manifest_dir is not None else None)
+    )
+    scenario_resolved = (
+        Path(str(scenario_path)).expanduser().resolve()
+        if scenario_path
+        else (manifest_dir / "llm_scenario_scorer_prompt.md" if manifest_dir is not None else None)
+    )
+    ctx = JudgeContext(
+        client=client,
+        simple_prompt_path=str(simple_resolved) if (simple_resolved and simple_resolved.is_file()) else None,
+        scenario_prompt_path=str(scenario_resolved) if (scenario_resolved and scenario_resolved.is_file()) else None,
+        legacy_judge=legacy_judge,
+    )
+    typer.echo(
+        "Judge enabled: model={m}  simple_prompt={s}  scenario_prompt={c}  legacy={legacy}".format(
+            m=client.model,
+            s=ctx.simple_prompt_path or "(missing)",
+            c=ctx.scenario_prompt_path or "(missing)",
+            legacy="on" if ctx.legacy_judge is not None else "off",
+        )
+    )
+    return ctx
 
 
 def _build_trace_summarizer(cfg: dict) -> Optional[Any]:
@@ -229,7 +278,7 @@ def run_command(
         raise typer.Exit(code=2)
     testdata_prefixes = tuple(str(p) for p in testdata_prefixes_raw)
 
-    judge = _build_judge(cfg)
+    judge = _build_judge(cfg, manifest_path=Path(str(manifest_path)).expanduser().resolve())
     summarizer = _build_trace_summarizer(cfg)
 
     base_dir = str(artifacts_root) if artifacts_root else None
@@ -289,7 +338,16 @@ def run_command(
         for r in results:
             save_trial(r, session_dir)
             kind = "setup" if r.is_setup else f"entry_id={r.entry_id} query_id={r.query_id}"
-            judge_str = "" if r.is_setup or r.judge_score is None else f" judge={r.judge_score}"
+            judge_parts: list[str] = []
+            if not r.is_setup:
+                if r.judge_score is not None:
+                    judge_parts.append(f"judge={r.judge_score}")
+                elif any(v is not None for v in r.judge_subscores.values()):
+                    n = sum(1 for v in r.judge_subscores.values() if v is not None)
+                    judge_parts.append(f"judge_mode={r.judge_mode}/sub_n={n}")
+                if r.legacy_judge_score is not None:
+                    judge_parts.append(f"legacy={r.legacy_judge_score}")
+            judge_str = (" " + " ".join(judge_parts)) if judge_parts else ""
             cost_str = f"${r.total_cost_usd:.3f}" if r.cost_available else "n/a"
             typer.echo(
                 f"  turn {r.num_turns} [{agent}/{domain}] {kind}: status={r.status} "
@@ -326,21 +384,34 @@ def run_command(
 
     if judge is not None:
         typer.echo("\nLLM-as-judge scores (mean over query turns, 0-5 scale):")
-        scored: list[int] = []
+        simple_scored: list[int] = []
+        scenario_scored = 0
+        legacy_scored: list[int] = []
         errored = 0
         for domain in domain_order:
             for r in results_by_key.get((agent, BASE_CONDITION, domain), []):
                 if r.is_setup:
                     continue
+                has_subscores = any(v is not None for v in r.judge_subscores.values())
                 if r.judge_score is not None:
-                    scored.append(int(r.judge_score))
+                    simple_scored.append(int(r.judge_score))
+                elif has_subscores:
+                    scenario_scored += 1
                 elif r.judge_error:
                     errored += 1
-        if scored:
-            mean_score = sum(scored) / len(scored)
-            typer.echo(f"  mean={mean_score:.2f}  n={len(scored)}  errors={errored}")
-        else:
-            typer.echo(f"  no scores  errors={errored} (check judge config / litellm install)")
+                if r.legacy_judge_score is not None:
+                    legacy_scored.append(int(r.legacy_judge_score))
+        parts: list[str] = []
+        if simple_scored:
+            parts.append(f"simple mean={sum(simple_scored) / len(simple_scored):.2f} n={len(simple_scored)}")
+        if scenario_scored:
+            parts.append(f"scenario_scored={scenario_scored}")
+        if legacy_scored:
+            parts.append(f"legacy mean={sum(legacy_scored) / len(legacy_scored):.2f} n={len(legacy_scored)}")
+        parts.append(f"errors={errored}")
+        if not simple_scored and not scenario_scored and not legacy_scored:
+            parts.append("(check judge config / litellm install)")
+        typer.echo("  " + "  ".join(parts))
 
     json_path, md_path = write_summary(
         session_dir=session_dir,
@@ -357,23 +428,24 @@ def run_command(
 
 
 def _needs_rescore(trial: dict[str, Any]) -> bool:
-    """A query-turn trial needs rescoring if its score is missing/zero or it errored.
+    """A query-turn trial needs rescoring if it produced no usable judge output.
 
-    Setup turns are never judged. ``judge_score`` is normally an int in 1-5 or
-    ``None``; we treat ``0`` the same as ``None`` since the user reported a
-    failed judge surfacing as a zero score.
+    "Usable" means either the legacy/simple flat ``judge_score`` (an int in
+    1-5) OR at least one non-null entry in ``judge_subscores`` (the
+    scenario-aware judge's per-dimension scores). A trial counts as scored
+    even when ``judge_score`` is ``None`` provided sub-scores are present.
 
-    Intrinsically unscorable trials (missing ground truth, empty candidate)
-    are terminal and must not be retried — otherwise every rescore wastes a
-    pass on entries that can never produce a score.
+    Intrinsically unscorable trials (missing ground truth, empty candidate,
+    ``scoring_mode="skip"``) are terminal and never retried.
     """
     if trial.get("is_setup"):
         return False
     judge_error = trial.get("judge_error") or ""
     if judge_error in UNSCORABLE_JUDGE_ERRORS:
         return False
-    score = trial.get("judge_score")
-    if score is None or score == 0:
+    sub_scores = trial.get("judge_subscores") or {}
+    scored = trial.get("judge_score") is not None or any(v is not None for v in sub_scores.values())
+    if not scored:
         return True
     if judge_error:
         return True
@@ -459,7 +531,7 @@ def rescore_command(
     entries = load_eval_manifest(Path(str(manifest_path)).expanduser().resolve())
     entries_by_id = {e.entry_id: e for e in entries}
 
-    judge = _build_judge(cfg)
+    judge = _build_judge(cfg, manifest_path=Path(str(manifest_path)).expanduser().resolve())
     if judge is None:
         typer.echo("Error: judge is not configured (see messages above). Cannot rescore.", err=True)
         raise typer.Exit(code=2)
@@ -492,17 +564,32 @@ def rescore_command(
         result.judge_score = None
         result.judge_reasoning = ""
         result.judge_error = ""
+        result.judge_mode = ""
+        result.judge_subscores = {}
+        result.judge_flags = {}
+        result.judge_lists = {}
+        result.legacy_judge_score = None
+        result.legacy_judge_reasoning = ""
+        result.legacy_judge_error = ""
 
         _apply_judge(judge, entry, result)
 
         raw.update(asdict(result))
         path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
 
-        if result.judge_score is not None:
+        scored_ok = result.judge_score is not None or any(
+            v is not None for v in result.judge_subscores.values()
+        )
+        if scored_ok:
             rescored += 1
-            typer.echo(
-                f"  {path.name}: entry_id={result.entry_id} judge={result.judge_score}"
-            )
+            if result.judge_mode == "simple" and result.judge_score is not None:
+                typer.echo(f"  {path.name}: entry_id={result.entry_id} judge={result.judge_score}")
+            else:
+                n_sub = sum(1 for v in result.judge_subscores.values() if v is not None)
+                typer.echo(
+                    f"  {path.name}: entry_id={result.entry_id} "
+                    f"mode={result.judge_mode} sub_scores={n_sub}"
+                )
         elif result.judge_error in UNSCORABLE_JUDGE_ERRORS:
             unscorable += 1
             typer.echo(

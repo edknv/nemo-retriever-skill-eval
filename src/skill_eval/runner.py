@@ -30,6 +30,33 @@ DEFAULT_AGENT_MODELS = {
     "codex": "gpt-5.5",
 }
 
+# Scenario-aware judging routes each entry by its ``scoring_mode`` field.
+# ``ANSWERABLE_SCORING_MODES`` are the modes for which a missing
+# ``ground_truth_answer`` makes the trial unscorable; ``ANSWER_REQUIRED``
+# adds modes where the AGENT must produce a non-empty answer for the judge
+# to have anything to grade (refusal / capability_gap / dispatcher_prompt all
+# expect the agent to emit explanatory text even when no answer is possible).
+ANSWERABLE_SCORING_MODES: frozenset[str] = frozenset({"answerable_retrieval", "ingest_plus_answer"})
+ANSWER_REQUIRED_SCORING_MODES: frozenset[str] = frozenset(
+    {"answerable_retrieval", "ingest_plus_answer", "refusal", "capability_gap", "dispatcher_prompt"}
+)
+
+
+@dataclass
+class JudgeContext:
+    """Bag of judge state threaded from CLI into ``_apply_judge``.
+
+    Holds the chat-completion transport for the new scenario-aware judge
+    (``client``), the two on-disk prompt paths (``simple_prompt_path``,
+    ``scenario_prompt_path``), and the optional legacy ``LLMJudge``.
+    ``None`` is a valid path when no entries in the run need that mode.
+    """
+
+    client: Any
+    simple_prompt_path: str | None
+    scenario_prompt_path: str | None
+    legacy_judge: Any = None
+
 
 @functools.lru_cache(maxsize=8)
 def _load_prompt_template(name: str) -> str:
@@ -62,9 +89,23 @@ class TrialResult:
     errors: list[str] = field(default_factory=list)
     is_setup: bool = False
     domain: str = ""
+    # Legacy single-score field; for simple-mode entries the scenario judge
+    # also populates this to ``answer_correctness`` for backward compatibility
+    # with the existing summary/rescore paths.
     judge_score: int | None = None
     judge_reasoning: str = ""
     judge_error: str = ""
+    # Scenario-aware judge outputs. ``judge_mode`` is "simple" or "scenario";
+    # the rest are populated from ``judging.ScenarioJudgeResult``.
+    judge_mode: str = ""
+    judge_subscores: dict[str, int | None] = field(default_factory=dict)
+    judge_flags: dict[str, bool | None] = field(default_factory=dict)
+    judge_lists: dict[str, list[str]] = field(default_factory=dict)
+    # Hardcoded-prompt ``LLMJudge`` outputs, kept on every trial when
+    # ``judge.legacy_enabled`` is true so scores stay comparable to old runs.
+    legacy_judge_score: int | None = None
+    legacy_judge_reasoning: str = ""
+    legacy_judge_error: str = ""
     tool_use_summary: str = ""
     cost_available: bool = True
 
@@ -822,40 +863,97 @@ def _run_one_turn(
     return result
 
 
-UNSCORABLE_JUDGE_ERRORS: frozenset[str] = frozenset({"no_ground_truth", "empty_candidate"})
+UNSCORABLE_JUDGE_ERRORS: frozenset[str] = frozenset(
+    {"no_ground_truth", "empty_candidate", "scoring_mode_skip"}
+)
 
 
-def _apply_judge(judge: Any, entry: DatasetEntry, result: TrialResult) -> None:
-    """Score ``result.final_answer`` against ``entry.ground_truth_answer``.
+def _apply_judge(ctx: Any, entry: DatasetEntry, result: TrialResult) -> None:
+    """Score ``result`` against ``entry`` via the dispatched judge.
 
-    Mutates the result in place. When the judge is unset we skip silently
-    (judging just isn't configured). When the entry has no ground-truth answer
-    or the trial produced no final answer the result is intrinsically
-    unscorable; we record that on ``judge_error`` so rescore passes can
-    recognize it as terminal instead of retrying forever.
+    Behaviour summary:
+      - ``ctx is None``               -> no-op (judge disabled).
+      - ``scoring_mode == "skip"``    -> terminal ``judge_error="scoring_mode_skip"``.
+      - Answerable-mode entry with
+        no ground truth               -> terminal ``judge_error="no_ground_truth"``.
+      - Empty ``final_answer`` for a
+        mode that requires an answer  -> terminal ``judge_error="empty_candidate"``.
+      - Otherwise: dispatch via
+        ``judging.evaluate_entry`` and stamp sub-scores onto ``result``.
+
+    For simple-mode entries (and only for them) the ``answer_correctness``
+    sub-score is also written to ``result.judge_score`` so existing summary /
+    rescore code paths that read the flat 1-5 score keep working.
+
+    The legacy ``LLMJudge`` runs in parallel when ``ctx.legacy_judge`` is set
+    and the trial has both a ground-truth answer and a non-empty candidate.
+    A failure in one judge does not block the other -- they use different
+    prompts and may be sensitive to different inputs (e.g. context-window
+    limits handled by ``truncate_for_judge``).
     """
-    if judge is None:
+    if ctx is None:
         return
-    if not entry.ground_truth_answer:
+    if entry.scoring_mode == "skip":
+        result.judge_error = "scoring_mode_skip"
+        return
+
+    needs_answer_mode = entry.scoring_mode in ANSWER_REQUIRED_SCORING_MODES or entry.scoring_mode == ""
+    answerable_mode = entry.scoring_mode in ANSWERABLE_SCORING_MODES or entry.scoring_mode == ""
+    if answerable_mode and not entry.ground_truth_answer:
         result.judge_error = "no_ground_truth"
         return
-    if not result.final_answer:
+    if needs_answer_mode and not result.final_answer:
         result.judge_error = "empty_candidate"
         return
+
+    from skill_eval.judging import evaluate_entry, truncate_for_judge
+
+    verdict = None
     try:
-        verdict = judge.judge(
-            query=entry.original_query,
-            reference=entry.ground_truth_answer,
-            candidate=result.final_answer,
+        verdict = evaluate_entry(
+            client=ctx.client,
+            entry=entry,
+            result=result,
+            simple_prompt_path=ctx.simple_prompt_path,
+            scenario_prompt_path=ctx.scenario_prompt_path,
         )
     except Exception as exc:
         result.judge_error = f"judge_invocation_error: {exc}"
-        logger.warning("LLMJudge raised for entry_id=%s: %s", result.entry_id, exc, exc_info=True)
-        return
-    result.judge_score = verdict.score
-    result.judge_reasoning = verdict.reasoning or ""
-    if verdict.error:
-        result.judge_error = verdict.error
+        logger.warning("evaluate_entry raised for entry_id=%s: %s", result.entry_id, exc, exc_info=True)
+
+    if verdict is not None:
+        result.judge_mode = verdict.mode
+        result.judge_subscores = dict(verdict.sub_scores)
+        result.judge_flags = dict(verdict.flags)
+        result.judge_lists = dict(verdict.lists)
+        result.judge_reasoning = verdict.rationale or ""
+        if verdict.mode == "simple":
+            result.judge_score = verdict.sub_scores.get("answer_correctness")
+        if verdict.error:
+            result.judge_error = verdict.error
+
+    # Also run the legacy LLMJudge for cross-run comparability when possible.
+    # Independent of the new judge: a failure in one does not block the other.
+    if ctx.legacy_judge is not None and entry.ground_truth_answer and result.final_answer:
+        try:
+            legacy_verdict = ctx.legacy_judge.judge(
+                query=entry.original_query,
+                reference=entry.ground_truth_answer,
+                candidate=truncate_for_judge(result.final_answer),
+            )
+        except Exception as exc:
+            result.legacy_judge_error = f"legacy_judge_invocation_error: {exc}"
+            logger.warning(
+                "legacy LLMJudge raised for entry_id=%s: %s",
+                result.entry_id,
+                exc,
+                exc_info=True,
+            )
+        else:
+            result.legacy_judge_score = legacy_verdict.score
+            result.legacy_judge_reasoning = legacy_verdict.reasoning or ""
+            if legacy_verdict.error:
+                result.legacy_judge_error = legacy_verdict.error
 
 
 def run_session(
