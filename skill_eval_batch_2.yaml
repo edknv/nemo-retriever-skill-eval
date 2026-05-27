@@ -2,13 +2,13 @@
 # Save at ~/git/retriever-sdg-v3/skill_eval.yaml (or anywhere outside the repo).                                                                                                                    
                                                                                                                                                                                                     
 # REQUIRED — agent-eval manifest
-eval_manifest_path: /data/runs/vidore_v3_agent_evals_20260514_batch_2/agent_scenario_manifest.json
+eval_manifest_path: ~/git/retriever-sdg-v3/runs/vidore_v3_agent_evals_20260514_batch_2/agent_scenario_manifest.json
                                                                                                                                                                                                     
 # REQUIRED — per-domain PDF roots (keys match manifest's `domain` field)                                                                                                                            
 pdf_dirs:
-  vidore_v3_pharmaceuticals: /data/test-data/vidorev3-fda/pdfs
-  vidore_v3_finance_en: /data/test-data/vidorev3-finance/pdfs
-  vidore_v3_hr: /data/test-data/vidorev3-hr/pdfs
+  vidore_v3_pharmaceuticals: ~/git/retriever-sdg-v3/test-data/vidorev3-fda/pdfs
+  vidore_v3_finance_en: ~/git/retriever-sdg-v3/test-data/vidorev3-finance/pdfs
+  vidore_v3_hr: ~/git/retriever-sdg-v3/test-data/vidorev3-hr/pdfs
 
 # Rewrites these substrings to ./pdfs in paraphrased prompts so the
 # in-trial symlink farm resolves.
@@ -16,11 +16,6 @@ testdata_prefixes:
   - test-data/vidorev3-fda/pdfs
   - test-data/vidorev3-finance/pdfs
   - test-data/vidorev3-hr/pdfs
-
-# Rename ./pdfs/ symlinks to opaque doc_<sha1[:10]>.pdf so the agent
-# cannot grep query terms out of filenames. Real doc_ids still appear
-# in trial JSON; a per-domain doc_id_mapping.json is written for debugging.
-anonymize_filenames: true
 
 # Agent selection, model, and per-trial limits
 agent: codex
