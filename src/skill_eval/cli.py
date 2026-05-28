@@ -27,12 +27,14 @@ from skill_eval.runner import (
     DocIdMap,
     SUPPORTED_AGENTS,
     UNSCORABLE_JUDGE_ERRORS,
+    SessionRun,
     TrialResult,
     _apply_judge,
     archive_session_log,
     cleanup_session_workdir,
     extract_compact_trace,
     run_session,
+    save_compact_trace,
     save_trial,
 )
 
@@ -203,6 +205,107 @@ def _resolve_domain_label(entries: list[DatasetEntry], cfg: dict, domain: str) -
     return "PDFs"
 
 
+def _relative_artifact(path: Path, session_dir: Path) -> str:
+    try:
+        return str(path.relative_to(session_dir))
+    except ValueError:
+        return str(path)
+
+
+def _trace_label(result: TrialResult) -> str:
+    if result.is_setup:
+        return "setup"
+    return f"query entry_id={result.entry_id} query_id={result.query_id}"
+
+
+def _process_session_logs(
+    *,
+    session_dir: Path,
+    agent: str,
+    domain: str,
+    session_run: SessionRun,
+    summarizer: Optional[Any],
+) -> list[Path]:
+    """Archive raw logs, write compact traces, and optionally summarize them.
+
+    Linear-session runs share one transcript across setup + all query turns,
+    so we archive once and stamp the same relative path on every trial.
+    Parallel-isolated runs have one transcript per trial, archived once per
+    ``(session_id, workdir)`` pair, and a per-trial compact trace.
+    """
+    results = session_run.results
+    if not results:
+        return []
+
+    archived_by_session: dict[tuple[str, str], Path | None] = {}
+    archived_paths: list[Path] = []
+    trace_parts: list[str] = []
+
+    if session_run.execution_mode == "linear_session":
+        first = results[0]
+        archived = archive_session_log(
+            session_dir=session_dir,
+            agent=agent,
+            condition=BASE_CONDITION,
+            domain=domain,
+            session_uuid=first.session_id,
+            workdir=session_run.workdir,
+        )
+        if archived is not None:
+            archived_paths.append(archived)
+            rel = _relative_artifact(archived, session_dir)
+            for r in results:
+                r.raw_log_path = rel
+        trace = extract_compact_trace(agent, session_run.workdir, first.session_id)
+        if trace:
+            trace_path = save_compact_trace(first, session_dir, trace, suffix="session")
+            rel_trace = _relative_artifact(trace_path, session_dir)
+            for r in results:
+                r.compact_trace_path = rel_trace
+            trace_parts.append(trace)
+    else:
+        for result in results:
+            workdir = session_run.result_workdirs.get(result.trial_id, session_run.workdir)
+            session_key = (result.session_id, str(workdir))
+            if session_key not in archived_by_session:
+                archived = archive_session_log(
+                    session_dir=session_dir,
+                    agent=agent,
+                    condition=BASE_CONDITION,
+                    domain=domain,
+                    session_uuid=result.session_id,
+                    workdir=workdir,
+                )
+                archived_by_session[session_key] = archived
+                if archived is not None:
+                    archived_paths.append(archived)
+            archived = archived_by_session[session_key]
+            if archived is not None:
+                result.raw_log_path = _relative_artifact(archived, session_dir)
+
+            trace = extract_compact_trace(
+                agent, workdir, result.session_id, first_turn_label=_trace_label(result)
+            )
+            if not trace:
+                continue
+            trace_path = save_compact_trace(result, session_dir, trace)
+            result.compact_trace_path = _relative_artifact(trace_path, session_dir)
+            trace_parts.append(trace)
+
+    if summarizer is not None and trace_parts:
+        narrative = summarizer.summarize(
+            condition=f"{agent}/{BASE_CONDITION}",
+            domain=domain,
+            trace="\n\n".join(trace_parts),
+        )
+        if narrative:
+            for result in results:
+                if result.is_setup:
+                    result.tool_use_summary = narrative
+                    break
+    return archived_paths
+
+
 @app.command("run")
 def run_command(
     config: Optional[Path] = typer.Option(
@@ -238,6 +341,15 @@ def run_command(
         "--anonymize-filenames/--no-anonymize-filenames",
         help="Rename ./pdfs/ symlinks to opaque doc_<sha1[:10]>.pdf so the agent "
              "cannot grep query terms from filenames. Overrides config.anonymize_filenames.",
+    ),
+    query_parallelism_override: Optional[int] = typer.Option(
+        None,
+        "--query-parallelism",
+        min=1,
+        help=(
+            "Run query turns after setup in isolated parallel sessions. "
+            "Defaults to config.query_parallelism, then 1 (linear session)."
+        ),
     ),
 ) -> None:
     """Run the benchmark across the dataset's domains, sequentially."""
@@ -289,6 +401,10 @@ def run_command(
         if anonymize_filenames is not None
         else bool(cfg.get("anonymize_filenames", False))
     )
+    query_parallelism = int(query_parallelism_override or cfg.get("query_parallelism", 1) or 1)
+    if query_parallelism < 1:
+        typer.echo("Error: query_parallelism must be >= 1.", err=True)
+        raise typer.Exit(code=2)
 
     judge = _build_judge(cfg, manifest_path=Path(str(manifest_path)).expanduser().resolve())
     summarizer = _build_trace_summarizer(cfg)
@@ -296,13 +412,17 @@ def run_command(
     base_dir = str(artifacts_root) if artifacts_root else None
     session_dir = create_session_dir("skilleval", base_dir=base_dir)
     typer.echo(f"Session dir: {session_dir}")
-    typer.echo(f"Agent: {agent}  model={model}  condition={BASE_CONDITION}")
+    typer.echo(
+        f"Agent: {agent}  model={model}  condition={BASE_CONDITION}  "
+        f"query_parallelism={query_parallelism}"
+    )
     typer.echo(f"Anonymize filenames: {'on' if anonymize else 'off'}")
 
     resolved_cfg = dict(cfg)
     resolved_cfg["agent"] = agent
     resolved_cfg["agent_model"] = model
     resolved_cfg["anonymize_filenames"] = anonymize
+    resolved_cfg["query_parallelism"] = query_parallelism
     (session_dir / "config.yaml").write_text(yaml.safe_dump(resolved_cfg, default_flow_style=False), encoding="utf-8")
 
     # Results keyed (agent, condition, domain) so reports can compare agent runs.
@@ -318,12 +438,13 @@ def run_command(
             )
             raise typer.Exit(code=2)
         domain_label = _resolve_domain_label(domain_entries, cfg, domain)
+        mode_hint = "linear session" if query_parallelism == 1 else "parallel isolated query sessions"
         typer.echo(
             f"Starting {agent} session for {domain} — setup + {len(domain_entries)} query turns "
-            f"(pdfs={pdf_source})"
+            f"({mode_hint}, parallelism={query_parallelism}, pdfs={pdf_source})"
         )
         doc_map = DocIdMap.from_pdf_dir(pdf_source) if anonymize else None
-        workdir, results = run_session(
+        session_run = run_session(
             agent=agent,
             entries=domain_entries,
             workdir_root=workdir_root,
@@ -336,21 +457,27 @@ def run_command(
             judge=judge,
             testdata_prefixes=testdata_prefixes,
             doc_map=doc_map,
+            query_parallelism=query_parallelism,
+        )
+        results = session_run.results
+        archived_logs = _process_session_logs(
+            session_dir=session_dir,
+            agent=agent,
+            domain=domain,
+            session_run=session_run,
+            summarizer=summarizer,
         )
         if summarizer is not None and results:
-            trace = extract_compact_trace(agent, workdir, results[0].session_id)
-            if trace:
-                narrative = summarizer.summarize(condition=f"{agent}/{BASE_CONDITION}", domain=domain, trace=trace)
-                if narrative:
-                    for r in results:
-                        if r.is_setup:
-                            r.tool_use_summary = narrative
-                            break
-                    typer.echo(f"  tool-use summary: {len(narrative)} chars")
-                else:
-                    typer.echo("  tool-use summary: (summarizer returned empty)")
+            setup_summary = next(
+                (r.tool_use_summary for r in results if r.is_setup and r.tool_use_summary), ""
+            )
+            if setup_summary:
+                typer.echo(f"  tool-use summary: {len(setup_summary)} chars")
             else:
-                typer.echo("  tool-use summary skipped: session JSONL unavailable")
+                typer.echo("  tool-use summary skipped: no compact trace or summarizer returned empty")
+        for archived in archived_logs:
+            typer.echo(f"  archived session log: {archived.relative_to(session_dir)}")
+
         for r in results:
             save_trial(r, session_dir)
             kind = "setup" if r.is_setup else f"entry_id={r.entry_id} query_id={r.query_id}"
@@ -365,10 +492,11 @@ def run_command(
                     judge_parts.append(f"legacy={r.legacy_judge_score}")
             judge_str = (" " + " ".join(judge_parts)) if judge_parts else ""
             cost_str = f"${r.total_cost_usd:.3f}" if r.cost_available else "n/a"
+            trace_str = f" trace={r.compact_trace_path}" if r.compact_trace_path else ""
             typer.echo(
                 f"  turn {r.num_turns} [{agent}/{domain}] {kind}: status={r.status} "
                 f"tokens(in/out/cache_r)={r.input_tokens}/{r.output_tokens}/{r.cache_read_input_tokens} "
-                f"cost={cost_str} retrieved={len(r.ranked_retrieved)}{judge_str}"
+                f"cost={cost_str} retrieved={len(r.ranked_retrieved)}{judge_str}{trace_str}"
             )
         results_by_key[(agent, BASE_CONDITION, domain)] = results
 
@@ -389,22 +517,11 @@ def run_command(
             f"recall@10={scores['recall_10']:.3f}"
         )
 
-        if results:
-            archived = archive_session_log(
-                session_dir=session_dir,
-                agent=agent,
-                condition=BASE_CONDITION,
-                domain=domain,
-                session_uuid=results[0].session_id,
-                workdir=workdir,
-            )
-            if archived is not None:
-                typer.echo(f"  archived session log: {archived.relative_to(session_dir)}")
-            else:
-                typer.echo(f"  session log not found for archiving ({agent}/{domain})")
-
-        cleanup_session_workdir(workdir)
-        typer.echo(f"Cleaned up workdir for {domain}\n")
+        # Walk every scratch workdir (setup + per-query clones when parallel)
+        # longest-path first so any nested clones nuke before their parent.
+        for scratch in sorted(set(session_run.workdirs), key=lambda p: len(str(p)), reverse=True):
+            cleanup_session_workdir(scratch)
+        typer.echo(f"Cleaned up workdirs for {domain}\n")
 
     if judge is not None:
         typer.echo("\nLLM-as-judge scores (mean over query turns, 0-5 scale):")

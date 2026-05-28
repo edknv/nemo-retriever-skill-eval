@@ -71,6 +71,12 @@ agent_models:
   codex: gpt-5.5
 per_trial_budget_usd: 5.0
 per_trial_timeout_s: 600
+# 1 preserves the historical single-session linear query loop. Values >1 run
+# query turns in isolated sessions copied from the completed setup workdir,
+# fanned out across a thread pool with the given degree of parallelism.
+# Per-query copies may temporarily create multiple LanceDBs / retrieval
+# indexes on disk; size ``per_trial_workdir_root`` accordingly.
+query_parallelism: 1
 per_trial_workdir_root: /tmp/skill_eval
 
 # ---------------------------------------------------------------------------
